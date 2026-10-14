@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "model": "SmilingWolf/wd-swinv2-tagger-v3",
+  "modelVersion": "627aef95638667ddcaa3ac8ae625e88ea5b02f51",
+  "license": "Apache-2.0",
+  "checkedAt": "2026-10-04",
+  "metadataUrl": "https://huggingface.co/api/models/SmilingWolf/wd-swinv2-tagger-v3/revision/627aef95638667ddcaa3ac8ae625e88ea5b02f51?blobs=true",
+  "files": [
+    {
+      "name": "model.onnx",
+      "size": 467460978,
+      "sha256": "e6774bff34d43bd49f75a47db4ef217dce701c9847b546523eb85ff6dbba1db1",
+      "url": "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/resolve/627aef95638667ddcaa3ac8ae625e88ea5b02f51/model.onnx",
+      "hashEvidence": "Official Hugging Face API siblings[].lfs.sha256; also published in the repository model.onnx LFS pointer."
+    },
+    {
+      "name": "selected_tags.csv",
+      "size": 308468,
+      "sha256": "298633d94d0031d2081c0893f29c82eab7f0df00b08483ba8f29d1e979441217",
+      "url": "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/resolve/627aef95638667ddcaa3ac8ae625e88ea5b02f51/selected_tags.csv",
+      "gitBlobId": "a2a653a5c89c8e387765eb1de9cfd2aedc92ee8d",
+      "hashEvidence": "SHA-256 computed from the fixed-revision official HTTPS response (308468 bytes); API supplies size and Git blob ID, not this SHA-256."
+    }
+  ],
+  "dependencies": {
+    "onnxruntime": "1.22.1",
+    "numpy": "2.2.6",
+    "Pillow": "11.2.1",
+    "coloredlogs": "15.0.1",
+    "humanfriendly": "10.0",
+    "flatbuffers": "25.2.10",
+    "packaging": "25.0",
+    "protobuf": "6.31.1",
+    "sympy": "1.14.0",
+    "mpmath": "1.3.0",
+    "pyreadline3": "3.5.4"
+  },
+  "thresholds": {"general": 0.35, "character": 0.85},
+  "sources": [
+    "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/tree/627aef95638667ddcaa3ac8ae625e88ea5b02f51",
+    "https://huggingface.co/spaces/SmilingWolf/wd-tagger/blob/87f2e2e/app.py",
+    "https://onnxruntime.ai/docs/get-started/with-python.html"
+  ]
+}

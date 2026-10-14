@@ -1,0 +1,13 @@
+{
+  "name": "pixiv-atelier",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "画序 · 本地 Pixiv 投稿管理与滚动预约",
+  "scripts": {
+    "start": "node server/index.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check public/app.js && node --check server/index.mjs && node --test tests/*.test.mjs"
+  },
+  "engines": { "node": ">=22" }
+}

@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 2,
+  "version": "public-static-mapping.1",
+  "description": "通用模型词汇与候选标签的静态映射，仅用于搜索和人工选择；不证明 Pixiv 标签存在。自动标签需要当前账号历史记录或实时搜索核实。",
+  "evidence": [],
+  "entries": [
+    {
+      "id": "girl",
+      "tag": "女の子",
+      "modelNames": [
+        "1girl",
+        "2girls",
+        "3girls",
+        "4girls",
+        "5girls",
+        "6+girls",
+        "multiple_girls"
+      ],
+      "evidenceIds": [],
+      "note": "人物标签，不推断成年或未成年；多人识别只汇总为同一个标签，不改变作品属性。"
+    },
+    {
+      "id": "smile",
+      "tag": "笑顔",
+      "modelNames": [
+        "smile"
+      ],
+      "evidenceIds": []
+    },
+    {
+      "id": "navel",
+      "tag": "おへそ",
+      "modelNames": [
+        "navel"
+      ],
+      "evidenceIds": []
+    },
+    {
+      "id": "swimsuit",
+      "tag": "水着",
+      "modelNames": [
+        "swimsuit"
+      ],
+      "evidenceIds": []
+    },
+    {
+      "id": "barefoot",
+      "tag": "裸足",
+      "modelNames": [
+        "barefoot"
+      ],
+      "evidenceIds": []
+    },
+    {
+      "id": "bare-shoulders",
+      "tag": "肩出し",
+      "modelNames": [
+        "bare_shoulders"
+      ],
+      "evidenceIds": []
+    },
+    {
+      "id": "barbara-genshin",
+      "tag": "バーバラ(原神)",
+      "modelNames": [
+        "barbara_(genshin_impact)"
+      ],
+      "evidenceIds": [],
+      "note": "仅匹配模型中的原神芭芭拉完整角色名，角色识别仍需用户确认。"
+    },
+    {
+      "id": "lumine-genshin",
+      "tag": "蛍(原神)",
+      "modelNames": [
+        "lumine_(genshin_impact)"
+      ],
+      "evidenceIds": [],
+      "note": "仅匹配模型中的原神荧完整角色名，角色识别仍需用户确认。"
+    },
+    {
+      "id": "kamisato-ayaka",
+      "tag": "神里綾華",
+      "modelNames": [
+        "kamisato_ayaka"
+      ],
+      "evidenceIds": [],
+      "note": "角色名映射仅用于候选搜索，角色识别仍需确认，不推断作品分级。"
+    }
+  ],
+  "kind": "static_mapping"
+}
