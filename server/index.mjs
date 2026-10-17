@@ -2,11 +2,12 @@ import http from 'node:http';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { createDemoState, blankState } from './seed.mjs';
-import { planReservations, reconcileRemote, validateJob } from './queue.mjs';
+import { planReservations, reconcileRemote, validateJob, isCompleteRemoteSnapshot } from './queue.mjs';
 import { createTagger } from './tagger.mjs';
 import { createBrowserConnector } from './browser-connector.mjs';
+import { createDedicatedChrome } from './dedicated-chrome.mjs';
 import { tagQueries, rankPixivTags, selectAutomaticTags, annotateTagCandidates } from './recognition.mjs';
 import { defaultPostingTime, nextPostingSchedule } from './scheduling.mjs';
 import { createCharacterMemory } from './character-memory.mjs';
@@ -14,8 +15,11 @@ import { applyCharacterMemory } from './character-recall.mjs';
 import { createTagPools, normalizePoolTag } from './tag-pool.mjs';
 import { planManualCharacterTags, resolveManualCharacterTags } from './manual-character-tags.mjs';
 import { buildCharacterCatalog, composePostingTemplate } from './posting-templates.mjs';
-import { QUEUE_CHECK_INTERVAL_MS, nextQueueCheck, summarizeQueueRun } from './queue-automation.mjs';
+import { QUEUE_CHECK_INTERVAL_MS, QUEUE_PARALLEL_LIMIT, nextQueueCheck, summarizeQueueRun, publicationReviewAccountIds } from './queue-automation.mjs';
 import { normalizeAvatarUrl, fetchAvatar } from './account-avatar.mjs';
+import { fetchArtworkThumbnail } from './artwork-thumbnail.mjs';
+import { createAnalyticsStore } from './analytics.mjs';
+import { createAnalyticsCollector, analyticsAccountKey } from './analytics-collector.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const JSON_LIMIT = 1024 * 1024;
@@ -281,6 +285,8 @@ function connectorTagEvidence(candidate) {
 }
 
 export async function createServer(options = {}) {
+  const launcherToken = options.launcherToken ?? process.env.PIXIV_LAUNCHER_TOKEN ?? '';
+  let closing = false, activeRequests = 0;
   const dataDir = path.resolve(options.dataDir ?? path.join(ROOT, '.data'));
   const publicDir = path.resolve(options.publicDir ?? path.join(ROOT, 'public'));
   const nowProvider = options.now ?? (() => new Date());
@@ -304,6 +310,9 @@ export async function createServer(options = {}) {
     state.queueAutomation = { intervalMs: QUEUE_CHECK_INTERVAL_MS,
       nextCheckAt: state.queueAutomation?.nextCheckAt && Number.isFinite(Date.parse(state.queueAutomation.nextCheckAt))
         ? state.queueAutomation.nextCheckAt : nextQueueCheck(new Date(nowProvider()).toISOString()) };
+    state.publicationReviewAutomation = { ...state.publicationReviewAutomation, intervalMs: QUEUE_CHECK_INTERVAL_MS,
+      nextCheckAt: Number.isFinite(Date.parse(state.publicationReviewAutomation?.nextCheckAt))
+        ? state.publicationReviewAutomation.nextCheckAt : nextQueueCheck(new Date(nowProvider()).toISOString()) };
     if (state.queueRun?.running) state.queueRun = { ...state.queueRun, running: false,
       completedAt: new Date(nowProvider()).toISOString(), message: '上次预约执行因服务重启而中断；未确认的结果将在下次检查时核对。' };
   }
@@ -316,16 +325,61 @@ export async function createServer(options = {}) {
   let chain = Promise.resolve();
   let tagPoolContextVersion = 0;
   let pixivSyncPending = false;
+  let dedicatedChangePending = false;
   let queueRunPending = null, queueRunProgress = null, queueRunMode = null;
   let queueStopRequested = false;
   const queueStoppedAccounts = new Set();
   const avatarCache = new Map();
+  const thumbnailCache = new Map(), thumbnailPending = new Map(), thumbnailWaiters = [];
+  let thumbnailActive = 0;
+  async function thumbnailSlot(task) {
+    if (thumbnailActive >= 4) await new Promise(resolve => thumbnailWaiters.push(resolve));
+    else thumbnailActive++;
+    try { return await task(); }
+    finally { const next = thumbnailWaiters.shift(); if (next) next(); else thumbnailActive--; }
+  }
   const active = () => envelope.states[envelope.mode];
   const currentTime = () => envelope.mode === 'demo' ? active().settings.demoNow : new Date(nowProvider()).toISOString();
   const connectorBase = options.connectorUrl ?? process.env.PIXIV_CONNECTOR_URL ?? '';
   const connectorToken = options.connectorToken ?? process.env.PIXIV_CONNECTOR_TOKEN ?? '';
-  const browserConnector = options.browserConnector ?? await createBrowserConnector({ dataDir, now: nowProvider });
+  const browserConnector = options.browserConnector ?? await createBrowserConnector({ dataDir, now: nowProvider,
+    dedicatedChrome: options.dedicatedChrome ?? createDedicatedChrome({ dataDir }) });
   const browserConfigured = () => envelope.states.live.accounts.some(account => account.browser?.targetId);
+  const analyticsStore = options.analyticsStore ?? createAnalyticsStore({ dataDir, now: nowProvider });
+  const analyticsCollector = createAnalyticsCollector({ store: analyticsStore, now: nowProvider,
+    getContext: () => ({ mode: envelope.mode, accounts: active().accounts, contextVersion: tagPoolContextVersion }),
+    fetchAnalytics: (account, input) => {
+      if (!browserConnector.analytics) throw new Error('当前连接器尚不支持统计采集，请连接已登录的 Chrome。');
+      return browserConnector.analytics(account, input);
+    },
+    getCharacters: () => characterMemory.list({ mode: 'live' }),
+    getSeedWorks: async account => {
+      const scope = { mode: 'live', accountId: account.id, pixivUserId: account.pixivUserId };
+      const evidence = tagPools.evidence(scope, [], { jobs: envelope.states.live.jobs });
+      const catalog = buildCharacterCatalog({ scope, evidence, characters: await characterMemory.list({ mode: 'live' }) });
+      const identityByWork = new Map();
+      for (const template of catalog.templates) for (const id of template.sourceArtworkIds || []) {
+        const list = identityByWork.get(String(id)) || [];
+        list.push({ englishName: template.englishName, gameTags: template.gameTags }); identityByWork.set(String(id), list);
+      }
+      return evidence.recentWorks.map(work => ({ ...work,
+        ...(identityByWork.has(String(work.artworkId)) ? { characters: identityByWork.get(String(work.artworkId)) } : {}) }));
+    },
+    ...(options.analyticsBatchDelayMs !== undefined ? { batchDelayMs: options.analyticsBatchDelayMs } : {}),
+  });
+  function analyticsScope(accountId = 'all') {
+    if (accountId !== 'all' && !active().accounts.some(account => account.id === accountId)) fail('统计账号不存在。', 404);
+    const accounts = envelope.mode === 'live' ? active().accounts : [];
+    return { accounts, accountIds: accounts.map(analyticsAccountKey),
+      accountId: accountId === 'all' ? 'all' : accounts.some(account => account.id === accountId) ? analyticsAccountKey(accounts.find(account => account.id === accountId)) : 'demo:no-data' };
+  }
+  function analyticsStatus() {
+    const scope = analyticsScope();
+    const stored = analyticsStore.status({ accountIds: scope.accountIds });
+    return { ...stored, ...(envelope.mode === 'live' ? analyticsCollector.status() : {
+      running: false, nextRegularAt: null, errors: [], message: '演示模式不读取真实账号统计；请切换到正式模式。',
+    }), mode: envelope.mode };
+  }
   let connectorUrl;
   if (connectorBase) {
     connectorUrl = new URL(connectorBase);
@@ -358,15 +412,23 @@ export async function createServer(options = {}) {
     })();
     try { return await taggerCheck; } finally { taggerCheck = null; }
   }
-  async function persist(snapshot = envelope) {
+  let persistChain = Promise.resolve();
+  function persist(snapshot = envelope) {
+    // Capture at the state transaction boundary; queued writes must never
+    // serialize a later, concurrently mutated envelope or overtake each other.
+    const captured = JSON.stringify(snapshot, null, 2);
+    const result = persistChain.then(async () => {
     const temp = `${stateFile}.${randomUUID()}.tmp`;
     try {
-      await fs.writeFile(temp, JSON.stringify(snapshot, null, 2), { mode: 0o600 });
+      await fs.writeFile(temp, captured, { mode: 0o600 });
       await fs.rename(temp, stateFile);
     } catch (error) {
       await fs.unlink(temp).catch(() => {});
       throw error;
     }
+    });
+    persistChain = result.catch(() => {});
+    return result;
   }
   await persist();
   const publicState = () => {
@@ -458,13 +520,43 @@ export async function createServer(options = {}) {
     }
   }
   function postingIdentityLost(error) {
-    return ['identity_mismatch', 'unbound', 'tab_gone'].includes(error?.code)
+    return ['identity_mismatch', 'login_required', 'unbound', 'tab_gone'].includes(error?.code)
       || /账号.*(?:改变|退出|不符|不匹配)|登录.*(?:失效|退出)/.test(String(error?.message || ''));
   }
   async function browserSnapshot(account) {
     const snapshot = await browserConnector.snapshot(account, { jobs: envelope.states.live.jobs });
     captureAvatar(account, snapshot);
     return snapshot;
+  }
+  function requireDedicatedChange(account) {
+    if (envelope.mode !== 'live') fail('请先切换到真实工作空间。', 409);
+    if (connectorUrl) fail('当前使用外部连接器，请先移除 PIXIV_CONNECTOR_URL 配置。', 409);
+    if (queueRunPending || pixivSyncPending || analyticsCollector.status().running) fail('正在采集数据或处理预约，请等待当前任务完成后切换浏览器。', 409);
+    if (account && !/^\d+$/.test(String(account.pixivUserId || ''))) fail('请先填写此账号的 Pixiv 用户 ID，以便核对登录身份。', 409);
+  }
+  function pendingDedicated(account) {
+    const previous = account.browser || {};
+    account.browser = { mode: 'dedicated', targetId: null, postingEnabled: false, loginPending: true,
+      resumePostingEnabled: previous.resumePostingEnabled ?? previous.postingEnabled === true,
+      ...(['interactive', 'headless'].includes(previous.runtimeMode) ? { runtimeMode: previous.runtimeMode } : {}) };
+    account.connected = false;
+    account.remote = { ...account.remote, syncOk: false, error: '请打开专用 Chrome，登录此账号后确认。' };
+    tagPoolContextVersion++;
+  }
+  function acceptDedicated(account, result, now) {
+    if (String(result?.account?.pixivUserId) !== String(account.pixivUserId)
+      || String(result?.snapshot?.pixivUserId) !== String(account.pixivUserId)) fail('专用 Chrome 登录的 Pixiv 账号与此账号不一致，请切换到正确的账号。', 409);
+    if (!result.snapshot.connected || !isCompleteRemoteSnapshot(result.snapshot, account)
+      || result.account.browser?.mode !== 'dedicated' || !result.account.browser?.targetId) fail('尚未完整确认专用 Chrome 的登录状态，请登录后重试。', 409);
+    const resumePosting = account.browser.resumePostingEnabled === true;
+    account.browser = { mode: 'dedicated', targetId: result.account.browser.targetId, loginPending: false,
+      postingEnabled: resumePosting && result.snapshot.premium === true,
+      runtimeMode: result.account.browser.runtimeMode === 'interactive' ? 'interactive' : 'headless' };
+    account.connected = true; account.premium = result.snapshot.premium === true;
+    captureAvatar(account, result.snapshot);
+    tagPoolContextVersion++;
+    const state = reconcileRemote(active(), account.id, result.snapshot, now); replaceState(state);
+    return state;
   }
   async function connector(endpoint, method = 'GET', payload, { manualPosting = false, shouldStop } = {}) {
     if (!connectorUrl) {
@@ -485,6 +577,9 @@ export async function createServer(options = {}) {
       }
     }
     if (!connectorUrl) fail('真实 pixiv 连接器尚未配置。作品已保存在本机；当前不会向 pixiv 投稿。', 503);
+    if (method === 'POST' && /\/reservations$/.test(endpoint) && typeof shouldStop === 'function' && shouldStop()) {
+      return { definitive: true, outcome: 'not_uploaded', paused: true, error: '预约已暂停，尚未提交。' };
+    }
     let response;
     try {
       response = await fetch(new URL(`${connectorUrl.pathname.replace(/\/$/, '')}${endpoint}`, connectorUrl), {
@@ -671,7 +766,7 @@ export async function createServer(options = {}) {
           result = {...result, warnings:[...(result.warnings||[]).filter(w=>!w.includes('有来源证据')), ...(searched.historyWarning?[searched.historyWarning]:[])]};
         } catch (error) {
           const cached = applyCachedPool();
-          result = {...result, warnings:[...(result.warnings||[]), `Pixiv 全站匹配未完成：${error.message} ${cached ? '当前使用此账号已核实的常用标签缓存，核实日期保留在候选中。' : '当前显示本地候选，静态映射尚未核实，不会自动填入标签。'}`]};
+          result = {...result, warnings:[...(result.warnings||[]), `Pixiv 全站匹配未完成：${error.message} ${cached ? '当前使用此账号已核实的常用标签缓存，核实日期保留在候选中。' : '当前仅显示已有本地证据的候选。'}`]};
         }
       } else if (mode === 'live') {
         const cached = applyCachedPool();
@@ -740,16 +835,29 @@ export async function createServer(options = {}) {
   }
   function replaceState(next) { envelope.states[envelope.mode] = next; }
   function demoSnapshot(account) { return { ok: true, complete: true, total: account.remote.reservations.filter(item => ['reserved', 'scheduled', 'uploading'].includes(item.status)).length, reservations: clone(account.remote.reservations) }; }
-  async function syncPixivStatus() {
+  function recordPublicationReview(state, summary, before, source) {
+    const completedAt = summary.completedAt || currentTime();
+    const previous = new Map(before.map(job => [job.id, job.status]));
+    state.publicationReviewAutomation = { ...state.publicationReviewAutomation,
+      intervalMs: QUEUE_CHECK_INTERVAL_MS, nextCheckAt: nextQueueCheck(completedAt),
+      lastAttemptAt: summary.startedAt || completedAt,
+      ...(summary.succeeded > 0 ? { lastCheckedAt: completedAt } : {}),
+      lastResult: { ...clone(summary), source, completedAt, checked: summary.succeeded > 0,
+        message: summary.succeeded > 0 ? '已完成至少一个账号的状态核对。' : '本次未完成账号状态核对，请查看失败或跳过原因。',
+        published: state.jobs.filter(job => job.status === 'published' && previous.get(job.id) !== 'published').length,
+        remainingNeedsReview: state.jobs.filter(job => job.status === 'needs_review').length } };
+  }
+  async function syncPixivStatus({ source = 'manual', accountIds } = {}) {
     if (envelope.mode !== 'live') fail('演示模式不能同步真实 Pixiv，请先切换到真实工作空间。', 409);
     let state = active();
+    const before = clone(state.jobs);
     let connectionFailure;
     const summary = { startedAt: currentTime(), completedAt: null, succeeded: 0, failed: 0, skipped: 0, accounts: [] };
     state.pixivSync = summary;
     await persist();
     // This operation only reads snapshots. It must not run tick(), whose second
     // stage can upload queued work, even when all posting switches are enabled.
-    for (const accountId of state.accounts.map(account => account.id)) {
+    for (const accountId of state.accounts.map(account => account.id).filter(id => !accountIds || accountIds.includes(id))) {
       let account = state.accounts.find(item => item.id === accountId);
       const result = { accountId, name: account.name };
       if (!connectorUrl && !account.browser?.targetId) {
@@ -757,7 +865,7 @@ export async function createServer(options = {}) {
         summary.accounts.push({ ...result, status: 'skipped', message: '尚未连接 Chrome，请先在账号管理中绑定 Pixiv。' });
       } else {
         try {
-          if (connectionFailure) throw connectionFailure;
+          if (connectionFailure && account.browser?.mode !== 'dedicated') throw connectionFailure;
           const snapshot = await connector(`/accounts/${encodeURIComponent(accountId)}/snapshot`);
           const records = snapshot?.reservations;
           const validRecords = Array.isArray(records) && records.every(record => record && typeof record === 'object' && !Array.isArray(record)
@@ -775,7 +883,7 @@ export async function createServer(options = {}) {
           summary.succeeded++;
           summary.accounts.push({ ...result, status: 'success', message: `已同步，Pixiv 当前预约 ${snapshot.total} 件。`, syncedAt });
         } catch (error) {
-          if (!connectorUrl && ['approval_required', 'disconnected', 'timeout'].includes(error.code)) connectionFailure = error;
+          if (!connectorUrl && account.browser?.mode !== 'dedicated' && ['approval_required', 'disconnected', 'timeout'].includes(error.code)) connectionFailure = error;
           account = state.accounts.find(item => item.id === accountId);
           const message = String(error.message || 'Pixiv 同步失败，请稍后重试。').slice(0, 1000);
           account.connected = false;
@@ -792,116 +900,236 @@ export async function createServer(options = {}) {
     summary.completedAt = currentTime();
     state.pixivSync = summary;
     state.queueReasons = planReservations(state, summary.completedAt).reasons;
-    log(state, `Pixiv 状态同步完成：${summary.succeeded} 个账号成功，${summary.failed} 个失败，${summary.skipped} 个未连接。`, summary.failed ? 'warning' : 'info', summary.completedAt);
+    recordPublicationReview(state, summary, before, source);
+    const reviewResult = state.publicationReviewAutomation.lastResult;
+    log(state, `Pixiv 状态${summary.succeeded ? '同步完成' : '未完成核对'}：${summary.succeeded} 个账号成功，${summary.failed} 个失败，${summary.skipped} 个未连接；新增确认发布 ${reviewResult.published} 件，仍有 ${reviewResult.remainingNeedsReview} 件需核对。`, summary.failed || !summary.succeeded ? 'warning' : 'info', summary.completedAt);
     await persist();
     return publicState();
   }
+  function startPublicationReview() {
+    if (pixivSyncPending || queueRunPending || dedicatedChangePending || envelope.mode !== 'live') return;
+    if (!publicationReviewAccountIds(active(), currentTime()).length) return;
+    pixivSyncPending = true;
+    serialize(async () => {
+      if (envelope.mode !== 'live') return;
+      const accountIds = publicationReviewAccountIds(active(), currentTime());
+      if (!accountIds.length || Date.parse(currentTime()) < Date.parse(active().publicationReviewAutomation.nextCheckAt)) return;
+      const before = clone(active().jobs), startedAt = currentTime();
+      try { await syncPixivStatus({ source: 'automatic', accountIds }); }
+      catch (error) {
+        // Network/account failures are recorded inside syncPixivStatus. Even an
+        // unexpected run failure must not turn the minute timer into a retry loop.
+        const summary = { startedAt, completedAt: currentTime(), succeeded: 0, failed: 1, skipped: 0,
+          accounts: [], error: String(error.message || '自动核对未完成。').slice(0, 1000) };
+        recordPublicationReview(active(), summary, before, 'automatic');
+        const { error: message, ...syncSummary } = summary;
+        active().pixivSync = syncSummary;
+        log(active(), `Pixiv 自动复核未正常完成：${message} 已延后六小时重试。`, 'warning', summary.completedAt);
+        await persist();
+      }
+    }).catch(error => console.error('Publication review:', error.message)).finally(() => { pixivSyncPending = false; });
+  }
   async function tick({ manualStart = false, errors = [] } = {}) {
-    let state = active();
-    let now = currentTime();
-    if (!state.settings.demo && !connectorUrl && !browserConfigured()) fail('真实 pixiv 连接器尚未配置。请在账号管理中连接 Chrome。', 503);
-    for (const accountId of state.accounts.map(account => account.id)) {
-      let account = state.accounts.find(item => item.id === accountId);
+    if (!active().settings.demo && !connectorUrl && !browserConfigured()) fail('真实 pixiv 连接器尚未配置。请在账号管理中连接 Chrome。', 503);
+    // The outer run still owns serialize(). Workers use this independent short
+    // transaction lock, never hold it across browser work, and always reload
+    // active state. No worker can overwrite another worker's completed result.
+    let stateChain = Promise.resolve(), fatalStop = false;
+    const blockedAccounts = new Set(), snapshotChains = new Map();
+    const transaction = operation => {
+      const result = stateChain.then(() => operation(clone(active())));
+      stateChain = result.catch(() => {});
+      return result;
+    };
+    async function commit(state) {
+      const nextEnvelope = { ...envelope, states: { ...envelope.states, [envelope.mode]: state } };
+      try { await persist(nextEnvelope); }
+      catch (error) { fatalStop = true; throw error; }
+      replaceState(state);
+    }
+    const stopped = accountId => fatalStop || queueStopRequested || queueStoppedAccounts.has(accountId) || blockedAccounts.has(accountId);
+    async function syncAccount(accountId) {
+      // Reads and their application are ordered per account so an older
+      // snapshot cannot arrive late and undo a newer confirmed reservation.
+      const previous = snapshotChains.get(accountId) || Promise.resolve();
+      const result = previous.then(async () => {
+        const account = clone(active().accounts.find(item => item.id === accountId));
+        if (!account) fail('投稿账号不存在。', 409);
+        const snapshot = active().settings.demo ? demoSnapshot(account) : await connector('/accounts/' + encodeURIComponent(accountId) + '/snapshot');
+        if (!isCompleteRemoteSnapshot(snapshot, account)) fail('Pixiv 预约快照不完整或账号不符，本轮不会继续提交该账号。', 502);
+        await transaction(async state => {
+          const latest = state.accounts.find(item => item.id === accountId);
+          if (!latest || latest.pixivUserId !== account.pixivUserId) fail('投稿账号已改变。', 409);
+          if (!state.settings.demo) {
+            latest.connected = snapshot.connected === true; latest.premium = snapshot.premium === true;
+            captureAvatar(latest, snapshot);
+          }
+          await commit(reconcileRemote(state, accountId, snapshot, currentTime()));
+        });
+        return snapshot;
+      });
+      snapshotChains.set(accountId, result.catch(() => {}));
+      return result;
+    }
+    const reviewBefore = clone(active().jobs), reviewSummary = { startedAt: currentTime(), completedAt: null,
+      succeeded: 0, failed: 0, skipped: 0, accounts: [] };
+    for (const accountId of active().accounts.map(account => account.id)) {
       try {
-        const snapshot = state.settings.demo ? demoSnapshot(account) : await connector(`/accounts/${encodeURIComponent(accountId)}/snapshot`);
-        if (!state.settings.demo) {
-          account.connected = snapshot.ok === true && snapshot.connected === true;
-          account.premium = snapshot.premium === true;
-        }
-        now = currentTime();
-        state = reconcileRemote(state, accountId, snapshot, now);
-        replaceState(state);
-      } catch (error) {
-        account.remote.syncOk = false;
-        if (!state.settings.demo) account.connected = false;
-        if (!state.settings.demo && !connectorUrl && account.browser && postingIdentityLost(error)) account.browser.postingEnabled = false;
-        log(state, `${account.name}：${error.message}`, 'error', currentTime());
-        errors.push({ accountId, message: String(error.message).slice(0, 1000) });
+        await syncAccount(accountId);
+        reviewSummary.succeeded++;
+        reviewSummary.accounts.push({ accountId, status: 'success' });
+      }
+      catch (error) {
+        blockedAccounts.add(accountId);
+        reviewSummary.failed++;
+        reviewSummary.accounts.push({ accountId, status: 'error', message: String(error.message).slice(0, 1000) });
+        await transaction(async state => {
+          const account = state.accounts.find(item => item.id === accountId);
+          account.remote.syncOk = false;
+          if (!state.settings.demo) account.connected = false;
+          if (!state.settings.demo && !connectorUrl && account.browser && postingIdentityLost(error)) account.browser.postingEnabled = false;
+          log(state, account.name + '：' + error.message, 'error', currentTime());
+          errors.push({ accountId, message: String(error.message).slice(0, 1000) });
+          await commit(state);
+        });
       }
     }
-    const plan = planReservations(state, currentTime());
-    state.queueReasons = plan.reasons;
-    if (state.settings.queuePaused) { await persist(); return; }
-    for (const action of plan.actions) {
-      if (queueStopRequested) break;
-      if (queueStoppedAccounts.has(action.accountId)) continue;
-      // A refreshed snapshot can reveal reservations created outside this app.
-      // Recheck capacity before every upload, rather than spending a stale batch plan.
-      now = currentTime();
-      if (!planReservations(state, now).actions.some(candidate => candidate.jobId === action.jobId && candidate.accountId === action.accountId)) continue;
-      let job = state.jobs.find(item => item.id === action.jobId);
-      let account = state.accounts.find(item => item.id === action.accountId);
-      if (!job || !account) continue;
-      if (!manualStart && !state.settings.demo && !connectorUrl && account.browser?.postingEnabled !== true) continue;
-      job.status = 'uploading'; job.uploadStartedAt = now; job.idempotencyKey = action.idempotencyKey;
-      await persist(); // Persist before an external side effect so retries cannot duplicate a post.
+    if (!active().settings.demo) await transaction(async state => {
+      reviewSummary.completedAt = currentTime();
+      recordPublicationReview(state, reviewSummary, reviewBefore, manualStart ? 'manual_queue' : 'automatic_queue');
+      await commit(state);
+    });
+    async function claim() {
+      return transaction(async state => {
+        if (fatalStop || queueStopRequested || state.settings.queuePaused) return null;
+        const plan = planReservations(state, currentTime());
+        state.queueReasons = plan.reasons;
+        const candidates = plan.actions.filter(action => {
+          const account = state.accounts.find(item => item.id === action.accountId);
+          return !stopped(action.accountId) && (manualStart || state.settings.demo || connectorUrl || account?.browser?.postingEnabled === true);
+        });
+        const activeByAccount = new Map();
+        for (const job of state.jobs) if (job.status === 'uploading') activeByAccount.set(job.accountId, (activeByAccount.get(job.accountId) || 0) + 1);
+        // Stable sorting preserves each account's chronological plan while
+        // letting another ready account use a window before one takes both.
+        candidates.sort((a, b) => (activeByAccount.get(a.accountId) || 0) - (activeByAccount.get(b.accountId) || 0));
+        const action = candidates[0];
+        if (!action) return null;
+        const job = state.jobs.find(item => item.id === action.jobId), account = state.accounts.find(item => item.id === action.accountId);
+        job.status = 'uploading'; job.uploadStartedAt = currentTime(); job.idempotencyKey = action.idempotencyKey;
+        // Durable slot claim comes before any form preparation or upload. The
+        // next claim counts this uploading job even though Pixiv cannot see it.
+        await commit(state);
+        return { action, job: clone(job), account: clone(account) };
+      });
+    }
+    async function processClaim({ action, job: submittedJob }) {
+      const accountId = action.accountId;
       try {
-        let snapshot;
-        if (state.settings.demo) {
-          account.remote.reservations.push({ remoteId: `demo-${randomUUID()}`, jobId: job.id, idempotencyKey: job.idempotencyKey, scheduledAt: job.scheduledAt, status: 'reserved' });
-          snapshot = demoSnapshot(account);
-        } else {
-          const files = await Promise.all(job.files.map(async file => ({ ...file, base64: (await fs.readFile(path.join(uploadDir, envelope.uploads[file.id].diskName))).toString('base64') })));
-          // File preparation and previous network requests may take long enough
-          // to cross a schedule boundary. Recheck immediately before the side effect.
-          now = currentTime();
+        // The native browser consumes trusted file paths itself. Avoid making
+        // two potentially 200 MB base64 payloads when no external adapter uses them.
+        const files = connectorUrl ? await Promise.all(submittedJob.files.map(async file => ({ ...file,
+          base64: (await fs.readFile(path.join(uploadDir, envelope.uploads[file.id].diskName))).toString('base64') }))) : submittedJob.files;
+        const ready = await transaction(async state => {
+          const job = state.jobs.find(item => item.id === action.jobId);
+          if (!job || job.status !== 'uploading' || job.idempotencyKey !== action.idempotencyKey) return false;
           const submissionState = { ...state, jobs: state.jobs.map(item => item.id === job.id ? { ...item, status: 'queued' } : item) };
-          if (queueStopRequested || queueStoppedAccounts.has(account.id)
-            || !planReservations(submissionState, now).actions.some(candidate => candidate.jobId === job.id && candidate.accountId === account.id)) {
-            job.status = 'queued';
-            delete job.uploadStartedAt;
-            if (Date.parse(job.scheduledAt) <= Date.parse(now)) {
-              job.status = 'needs_review'; job.reviewReason = 'schedule_expired';
-              job.lastError = '作品准备完成时预约时间已过，尚未发送，请重新安排。';
+          if (stopped(accountId) || !planReservations(submissionState, currentTime()).actions.some(candidate => candidate.jobId === job.id && candidate.accountId === accountId)) {
+            job.status = 'queued'; delete job.uploadStartedAt;
+            if (Date.parse(job.scheduledAt) <= Date.parse(currentTime())) {
+              job.status = 'needs_review'; job.reviewReason = 'schedule_expired'; job.lastError = '预约时间已过，尚未发送，请重新安排。';
             }
-            log(state, `${job.title}：提交前重新检查未通过，已保留本地作品，没有发送上传请求。`, 'warning', now);
-            await persist();
-            continue;
+            await commit(state); return false;
           }
-          const result = await connector(`/accounts/${encodeURIComponent(account.id)}/reservations`, 'POST', { job: { ...job, files }, idempotencyKey: job.idempotencyKey },
-            { manualPosting: manualStart, shouldStop: () => queueStopRequested || queueStoppedAccounts.has(account.id) });
-          now = currentTime();
+          return true;
+        });
+        if (!ready) return;
+        let result, simulatedSnapshot;
+        if (active().settings.demo) {
+          simulatedSnapshot = await transaction(async state => {
+            const account = state.accounts.find(item => item.id === accountId);
+            account.remote.reservations.push({ remoteId: 'demo-' + randomUUID(), jobId: submittedJob.id, idempotencyKey: action.idempotencyKey,
+              scheduledAt: submittedJob.scheduledAt, status: 'reserved' });
+            const snapshot = demoSnapshot(account);
+            await commit(reconcileRemote(state, accountId, snapshot, currentTime()));
+            return snapshot;
+          });
+        } else {
+          result = await connector('/accounts/' + encodeURIComponent(accountId) + '/reservations', 'POST',
+            { job: { ...submittedJob, files }, idempotencyKey: action.idempotencyKey },
+            { manualPosting: manualStart, shouldStop: () => stopped(accountId) });
           if (result.definitive === true && result.outcome === 'not_uploaded' && !result.reservation) {
-            if (result.paused === true) {
-              job.status = 'queued'; job.reservationAttempt = (job.reservationAttempt || 1) + 1;
-              delete job.idempotencyKey; delete job.uploadStartedAt;
-              log(state, `${job.title}：已暂停，尚未提交预约。`, 'info', now);
-              await persist(); continue;
+            if (result.paused === true || result.capacityBlocked === true) blockedAccounts.add(accountId);
+            await transaction(async state => {
+              const job = state.jobs.find(item => item.id === action.jobId);
+              if (result.paused === true || result.capacityBlocked === true) {
+                job.status = 'queued'; job.reservationAttempt = (job.reservationAttempt || 1) + 1;
+                delete job.idempotencyKey; delete job.uploadStartedAt;
+                log(state, job.title + (result.capacityBlocked ? '：预约名额已满，保留待补位。' : '：已停止本轮提交，尚未预约。'), 'info', currentTime());
+              } else {
+                job.status = 'failed'; job.uploadOutcome = 'not_uploaded';
+                job.lastError = typeof result.error === 'string' ? result.error.slice(0, 500) : '连接器明确确认作品尚未上传，可修改后重新加入队列。';
+                log(state, job.title + '：' + job.lastError, 'error', currentTime());
+              }
+              await commit(state);
+            });
+            if (result.capacityBlocked) {
+              try { await syncAccount(accountId); }
+              catch (error) {
+                await transaction(async state => {
+                  const account = state.accounts.find(item => item.id === accountId);
+                  if (account) account.remote.syncOk = false;
+                  errors.push({ accountId, message: '预约名额已满；重新核对名额失败：' + String(error.message).slice(0, 500) });
+                  await commit(state);
+                });
+              }
             }
-            job.status = 'failed'; job.uploadOutcome = 'not_uploaded';
-            job.lastError = typeof result.error === 'string' ? result.error.slice(0, 500) : '连接器明确确认作品尚未上传，可修改后重新加入队列。';
-            log(state, `${job.title}：${job.lastError}`, 'error', now);
-            await persist();
-            continue;
+            return;
           }
-          if (!result.reservation || !result.reservation.remoteId || result.reservation.status !== 'reserved') fail('连接器未返回可确认的远端预约；需要人工核对。', 502);
-          snapshot = await connector(`/accounts/${encodeURIComponent(account.id)}/snapshot`);
-          account.connected = snapshot.ok === true && snapshot.connected === true;
-          account.premium = snapshot.premium === true;
-          if (snapshot.ok !== true || !snapshot.reservations?.some(item => item.idempotencyKey === job.idempotencyKey && ['reserved', 'published'].includes(item.status) && (item.remoteId || item.id))) fail('远端快照尚未确认本次预约，已暂停重试以避免重复投稿。', 502);
+          if (!result.reservation?.remoteId || result.reservation.status !== 'reserved') fail('连接器未返回可确认的远端预约；需要人工核对。', 502);
         }
-        now = currentTime();
-        state = reconcileRemote(state, account.id, snapshot, now);
-        replaceState(state);
-        job = state.jobs.find(item => item.id === action.jobId);
-        if (!['reserved', 'published'].includes(job.status)) fail(job.lastError || '远端结果存在冲突，必须人工核对后再继续。', 502);
-        log(state, `${state.settings.demo ? '演示预约' : '远端预约已确认'}：${job.title}`, 'success', now);
+        const snapshot = simulatedSnapshot || await syncAccount(accountId);
+        if (!snapshot.reservations.some(item => item.idempotencyKey === action.idempotencyKey && ['reserved', 'published'].includes(item.status))) fail('远端快照尚未确认本次预约，已暂停重试以避免重复投稿。', 502);
+        await transaction(async state => {
+          const job = state.jobs.find(item => item.id === action.jobId);
+          if (!['reserved', 'published'].includes(job?.status)) fail(job?.lastError || '远端结果存在冲突，必须人工核对后再继续。', 502);
+          log(state, (state.settings.demo ? '演示预约' : '远端预约已确认') + '：' + job.title, 'success', currentTime());
+          await commit(state);
+        });
       } catch (error) {
-        job.status = 'needs_review'; job.lastError = error.message;
-        job.reviewReason ??= 'upload_outcome_unknown';
-        // An uncertain outcome invalidates the pre-upload account snapshot.
-        // Other accounts may continue, but this account must synchronize again.
-        const uncertainAccount = state.accounts.find(item => item.id === action.accountId);
-        if (uncertainAccount) {
-          uncertainAccount.remote.syncOk = false;
-          uncertainAccount.remote.error = '上传结果尚未确认；请重新同步远端状态后核对。';
-        }
-        log(state, `${job.title}：${error.message}`, 'error', currentTime());
+        // Set this before awaiting the state lock: another prepared window can
+        // observe the unknown outcome and stop before its final submit click.
+        blockedAccounts.add(accountId);
+        await transaction(async state => {
+          const job = state.jobs.find(item => item.id === action.jobId);
+          if (job && !['reserved', 'published'].includes(job.status)) {
+            job.status = 'needs_review'; job.lastError = String(error.message).slice(0, 1000);
+            job.reviewReason ??= 'upload_outcome_unknown';
+          }
+          const account = state.accounts.find(item => item.id === accountId);
+          if (account) { account.remote.syncOk = false; account.remote.error = '上传结果尚未确认；请重新同步远端状态后核对。'; }
+          log(state, submittedJob.title + '：' + error.message, 'error', currentTime());
+          errors.push({ accountId, jobId: submittedJob.id, message: String(error.message).slice(0, 1000) });
+          await commit(state);
+        });
       }
-      await persist();
     }
-    state.queueReasons = planReservations(state, currentTime()).reasons;
-    await persist();
+    async function worker() {
+      try {
+        while (!fatalStop && !queueStopRequested) {
+          const claimResult = await claim();
+          if (!claimResult) return;
+          await processClaim(claimResult);
+        }
+      } catch (error) {
+        fatalStop = true;
+        errors.push({ message: String(error.message || '无法保存预约状态，后续提交已停止。').slice(0, 1000) });
+      }
+    }
+    // HTTP adapters have no isolated-page/commit-lock or cooperative stop
+    // contract. Preserve their serial behavior; the native browser owns two.
+    await Promise.all(Array.from({ length: connectorUrl ? 1 : QUEUE_PARALLEL_LIMIT }, () => worker()));
+    await transaction(async state => { state.queueReasons = planReservations(state, currentTime()).reasons; await commit(state); });
   }
 
   // The button authorizes this single pass only. It does not enable a stored
@@ -948,6 +1176,7 @@ export async function createServer(options = {}) {
   }
 
   const server = http.createServer(async (req, res) => {
+    activeRequests++;
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
@@ -963,8 +1192,99 @@ export async function createServer(options = {}) {
       if (req.headers['sec-fetch-site'] === 'cross-site') fail('已拒绝跨站请求。', 403);
       const url = new URL(req.url, `http://127.0.0.1:${port}`);
       const pathname = decodeURIComponent(url.pathname);
+      if (closing) fail('应用正在安全退出，请稍后重新打开。', 503);
+      if (req.method === 'POST' && pathname === '/api/service/stop') {
+        const supplied = req.headers['x-atelier-launcher'];
+        if (!/^[a-f0-9]{64}$/.test(launcherToken) || typeof supplied !== 'string' || !/^[a-f0-9]{64}$/.test(supplied)
+          || !timingSafeEqual(Buffer.from(launcherToken), Buffer.from(supplied))) fail('只能使用本应用启动器安全退出。', 403);
+        await jsonBody(req);
+        const busy = () => queueRunPending || pixivSyncPending || dedicatedChangePending || analyticsCollector.status().running || activeRequests > 1;
+        if (busy()) fail('当前仍在投稿、同步或处理请求，请等待任务完成后再退出。', 409);
+        // Set this before yielding: timer callbacks and new requests cannot
+        // start work between the idle check and durable shutdown.
+        closing = true;
+        try {
+          await serialize(async () => {
+            if (busy()) fail('后台任务尚未结束，请稍后再退出。', 409);
+            await persist();
+          });
+        } catch (error) { closing = false; throw error; }
+        res.once('finish', () => { server.close(); server.closeIdleConnections?.(); });
+        return json(res, 202, { stopping: true });
+      }
       if (req.method === 'GET' && pathname === '/api/health') return json(res, 200, { ok: true, app: 'pixiv-publisher', mode: envelope.mode, connectorConfigured: Boolean(connectorUrl) || browserConfigured() });
       if (req.method === 'GET' && pathname === '/api/state') { if (!queueRunPending) await chain; return json(res, 200, publicState()); }
+      if (req.method === 'GET' && pathname === '/api/analytics/status') return json(res, 200, analyticsStatus());
+      if (req.method === 'GET' && pathname === '/api/analytics') {
+        const queryFields = new Set(['accountId', 'point', 'group', 'metric', 'sort', 'query', 'offset', 'limit', 'days', 'dailyDays']);
+        for (const key of url.searchParams.keys()) if (!queryFields.has(key)) fail('统计查询参数无效。');
+        const input = Object.fromEntries(url.searchParams);
+        for (const [key, values] of Object.entries({ point: ['current', '6h', '12h', '24h', '7d'], group: ['work', 'character', 'tag', 'interval'],
+          metric: ['views', 'bookmarks', 'likes', 'bookmarkRate'], sort: ['total', 'average', 'growth'], days: ['all', '30', '90', '180', '365'], dailyDays: ['7', '30', '90', '365'] })) if (input[key] !== undefined) enumValue(input[key], values, `统计${key}`);
+        for (const key of ['offset', 'limit']) if (input[key] !== undefined && (!/^\d+$/.test(input[key]) || !Number.isSafeInteger(Number(input[key])) || Number(input[key]) > (key === 'limit' ? 200 : 1000000))) fail('统计分页范围无效。');
+        if (input.query !== undefined) string(input.query, '统计搜索', 200);
+        const scope = analyticsScope(input.accountId || 'all');
+        const report = analyticsStore.report({ ...input, ...scope });
+        const byKey = new Map(scope.accounts.map(account => [analyticsAccountKey(account), account]));
+        report.filters.accountId = input.accountId || 'all';
+        for (const row of report.rows) if (row.accountId) {
+          const key = row.accountId, account = byKey.get(key);
+          row.accountId = account?.id; row.accountName = account?.name;
+          if (row.hasThumbnail && account) {
+            const source = analyticsStore.getWorkThumbnail({ accountId: key, artworkId: row.artworkId });
+            if (source) {
+              const version = createHash('sha256').update(key + source).digest('hex').slice(0, 12);
+              row.thumbnailUrl = `/api/analytics/accounts/${encodeURIComponent(account.id)}/works/${row.artworkId}/thumbnail?v=${version}`;
+            }
+          }
+        }
+        const accountRecords = new Map(report.accounts.map(record => [record.accountId, record]));
+        report.accounts = scope.accounts.filter(account => !input.accountId || input.accountId === 'all' || input.accountId === account.id)
+          .map(account => ({ ...(accountRecords.get(analyticsAccountKey(account)) || { latest: null, history: [] }), accountId: account.id, name: account.name }));
+        return json(res, 200, { ...report, mode: envelope.mode });
+      }
+      if (req.method === 'POST' && pathname === '/api/analytics/collect') {
+        const input = object(await jsonBody(req));
+        if (dedicatedChangePending) fail('正在切换专用 Chrome，请完成登录确认后再采集数据。', 409);
+        if (envelope.mode !== 'live') fail('请切换到正式模式后采集真实 Pixiv 数据。', 409);
+        const accountId = input.accountId ?? 'all'; analyticsScope(accountId);
+        if (!active().accounts.some(account => (accountId === 'all' || account.id === accountId) && account.browser?.targetId)) fail('请先在账号管理中连接 Chrome。', 409);
+        analyticsCollector.start({ accountId, force: true });
+        return json(res, 202, analyticsStatus());
+      }
+      const thumbnailRoute = /^\/api\/analytics\/accounts\/([a-z0-9-]+)\/works\/(\d{1,20})\/thumbnail$/i.exec(pathname);
+      if (req.method === 'GET' && thumbnailRoute) {
+        const [, accountId, artworkId] = thumbnailRoute;
+        const contextVersion = tagPoolContextVersion;
+        const account = envelope.mode === 'live' && active().accounts.find(item => item.id === accountId);
+        if (!account) fail('作品缩略图不可用。', 404);
+        const key = analyticsAccountKey(account);
+        const source = analyticsStore.getWorkThumbnail({ accountId: key, artworkId });
+        if (!source) fail('作品缩略图尚未采集。', 404);
+        const cacheKey = key + ':' + artworkId + ':' + source;
+        let cached = thumbnailCache.get(cacheKey);
+        if (!cached || cached.expiresAt <= Date.now()) {
+          if (!thumbnailPending.has(cacheKey)) {
+            if (thumbnailPending.size >= 100) fail('缩略图正在加载，请稍后重试。', 503);
+            const pending = thumbnailSlot(async () => {
+              try {
+                const value = await fetchArtworkThumbnail({ artworkId, thumbnailUrl: source }, { fetchImpl: options.thumbnailFetch ?? globalThis.fetch });
+                return { ...value, expiresAt: Date.now() + QUEUE_CHECK_INTERVAL_MS };
+              } catch { return { unavailable: true, expiresAt: Date.now() + 60000 }; }
+            }).then(value => {
+              if (thumbnailCache.size >= 64) thumbnailCache.delete(thumbnailCache.keys().next().value);
+              thumbnailCache.set(cacheKey, value); return value;
+            }).finally(() => thumbnailPending.delete(cacheKey));
+            thumbnailPending.set(cacheKey, pending);
+          }
+          cached = await thumbnailPending.get(cacheKey);
+        }
+        if (envelope.mode !== 'live' || tagPoolContextVersion !== contextVersion || !active().accounts.some(item => item.id === accountId && analyticsAccountKey(item) === key)) fail('作品缩略图不可用。', 404);
+        if (cached.unavailable) fail('暂时无法显示作品缩略图。', 502);
+        res.writeHead(200, { 'Content-Type': cached.contentType, 'Content-Length': cached.bytes.length,
+          'Cache-Control': 'private, max-age=3600', 'X-Content-Type-Options': 'nosniff' });
+        return res.end(cached.bytes);
+      }
       if (req.method === 'POST' && pathname === '/api/queue/start') {
         await jsonBody(req);
         startQueueRun('manual');
@@ -1013,7 +1333,7 @@ export async function createServer(options = {}) {
         await jsonBody(req);
         if (pixivSyncPending) fail('正在同步 Pixiv 状态，请等待本次同步完成。', 409);
         pixivSyncPending = true;
-        try { return json(res, 200, await serialize(syncPixivStatus)); }
+        try { return json(res, 200, await serialize(() => syncPixivStatus())); }
         finally { pixivSyncPending = false; }
       }
       if (req.method === 'GET' && pathname === '/api/tags/pool') {
@@ -1091,7 +1411,38 @@ export async function createServer(options = {}) {
         const result = await serialize(async () => {
           let state = active(); const now = currentTime();
           let createdJobId;
-          if (pathname === '/api/browser/discover' && req.method === 'POST') {
+          if (pathname === '/api/browser/dedicated/setup' && req.method === 'POST') {
+            requireDedicatedChange();
+            for (const account of state.accounts) requireDedicatedChange(account);
+            for (const account of state.accounts) if (account.browser?.mode !== 'dedicated') pendingDedicated(account);
+            log(state, '已为账号启用独立的专用 Chrome，请分别登录并确认账号。', 'info', now);
+          } else if (/^\/api\/accounts\/[^/]+\/browser-dedicated\/(open|verify|background)$/.test(pathname) && req.method === 'POST') {
+            const account = state.accounts.find(a => a.id === pathname.split('/')[3]);
+            if (!account) fail('账号不存在。', 404);
+            requireDedicatedChange(account);
+            const action = pathname.split('/').at(-1);
+            if (action !== 'open' && account.browser?.mode !== 'dedicated') fail('请先启用此账号的专用 Chrome。', 409);
+            const original = clone(account);
+            dedicatedChangePending = true;
+            try {
+              pendingDedicated(account);
+              await persist();
+              if (action === 'open') {
+                await browserConnector.openDedicatedLogin(account);
+                account.browser.runtimeMode = 'interactive';
+                log(state, `${account.name}：已打开专用 Chrome 登录窗口，请登录 Pixiv ${account.pixivUserId}。`, 'info', now);
+              } else {
+                const result = action === 'background' ? await browserConnector.backgroundDedicated(original) : await browserConnector.verifyDedicated(account);
+                state = acceptDedicated(account, result, now);
+                log(state, `${account.name}：${action === 'background' ? '已转入后台运行' : '已确认专用 Chrome 登录身份'}。`, 'success', now);
+              }
+            } catch (error) {
+              account.connected = false; account.browser.postingEnabled = false; account.browser.loginPending = true;
+              account.remote.syncOk = false; account.remote.error = error.message;
+              log(active(), `${account.name}：${error.message}`, 'error', now);
+              await persist(); throw error;
+            } finally { dedicatedChangePending = false; }
+          } else if (pathname === '/api/browser/discover' && req.method === 'POST') {
             if (envelope.mode !== 'live') fail('请先切换到真实工作空间。', 409);
             return browserConnector.discover();
           } else if (/^\/api\/accounts\/[^/]+\/browser$/.test(pathname) && req.method === 'POST') {
@@ -1125,6 +1476,7 @@ export async function createServer(options = {}) {
             const account = state.accounts.find(a => a.id === pathname.split('/')[3]);
             if (!account?.browser?.targetId) fail('账号尚未绑定 Chrome。', 409);
             const enabled = bool(input.enabled, '浏览器投稿开关');
+            if (enabled && account.browser.mode === 'dedicated' && account.browser.loginPending) fail('请先确认专用 Chrome 登录身份。', 409);
             if (enabled) {
               const snapshot = await browserSnapshot(account);
               if (!snapshot.connected || !snapshot.premium) fail('需先确认账号已登录且已开通 Premium。', 409);
@@ -1280,28 +1632,39 @@ export async function createServer(options = {}) {
       if (!res.headersSent) json(res, error.status ?? 500, { error: error.status ? error.message : '本地服务发生错误。请检查服务日志。', ...(error.details ? { details: error.details } : {}) });
       else res.end();
       if (!error.status) console.error(error);
-    }
+    } finally { activeRequests--; }
   });
   let timer;
   if (options.background !== false) {
     timer = setInterval(() => {
-      // This timer only reads local time; Pixiv is contacted at most once per
-      // six-hour automatic interval. Manual starts reset the same deadline.
-      if (!queueRunPending && envelope.mode === 'live' && (connectorUrl || active().accounts.some(a => a.browser?.postingEnabled))
-        && !active().settings.queuePaused && Date.parse(currentTime()) >= Date.parse(active().queueAutomation.nextCheckAt)) startQueueRun('automatic');
+      if (closing) return;
+      // This minute timer checks local deadlines only. Queue/full statistics
+      // run six-hourly; individual publication milestones run when due.
+      if (!dedicatedChangePending) analyticsCollector.start();
+      if (!queueRunPending && !pixivSyncPending && !dedicatedChangePending && envelope.mode === 'live') {
+        // A due queue run already reads all account snapshots, including paused
+        // accounts. Reuse that review instead of starting a duplicate read pass.
+        if ((connectorUrl || active().accounts.some(a => a.browser?.postingEnabled)) && !active().settings.queuePaused
+          && Date.parse(currentTime()) >= Date.parse(active().queueAutomation.nextCheckAt)) startQueueRun('automatic');
+        else if (Date.parse(currentTime()) >= Date.parse(active().publicationReviewAutomation.nextCheckAt)) startPublicationReview();
+      }
     }, options.pollInterval ?? 60000);
     timer.unref();
   }
   server.on('close', () => {
+    closing = true;
     clearInterval(timer);
-    Promise.resolve(browserConnector.close?.()).catch(error => console.error('Browser close:', error.message));
-    Promise.resolve(tagger.close?.()).catch(error => console.error('Tagger close:', error.message));
+    server.analyticsClosed = analyticsCollector.close().finally(() => analyticsStore.close());
+    server.shutdownComplete = Promise.allSettled([server.analyticsClosed, persistChain,
+      Promise.resolve(browserConnector.close?.()).catch(error => console.error('Browser close:', error.message)),
+      Promise.resolve(tagger.close?.()).catch(error => console.error('Tagger close:', error.message))]);
   });
   server.requestTimeout = 60000;
   server.headersTimeout = 30000;
   // Keep the promise available for shutdown/tests, while listening can begin
   // immediately even if model hashing or ONNX initialization takes minutes.
   server.taggerStatusReady = refreshTaggerStatus();
+  server.analytics = { store: analyticsStore, collector: analyticsCollector };
   return server;
 }
 

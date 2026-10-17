@@ -6,8 +6,8 @@ const failure = (message, code = 'browser_error') => new BrowserError(message, c
 
 // This connection attaches to existing Chrome targets without activating their
 // tabs or windows. It never exports cookies and never retries a sent operation.
-export function createBackgroundBrowser({ endpoint, WebSocketImpl = globalThis.WebSocket, timeoutMs = 45000, connectTimeoutMs = 15000 } = {}) {
-  let current = null, selected = null, sequence = 0;
+export function createBackgroundBrowser({ endpoint, WebSocketImpl = globalThis.WebSocket, timeoutMs = 45000, connectTimeoutMs = 15000, dedicated = false } = {}) {
+  let current = null, sequence = 0, generation = 0;
 
   function abandon(context, error) {
     if (context.closed) return;
@@ -96,161 +96,213 @@ export function createBackgroundBrowser({ endpoint, WebSocketImpl = globalThis.W
     if (!target) { context.sessions.delete(targetId); throw failure('绑定的 Chrome 标签页已关闭，请重新绑定。', 'tab_gone'); }
     let entry = context.sessions.get(targetId);
     if (!entry) {
-      const attached = await send(context, 'Target.attachToTarget', { targetId, flatten: true });
-      if (!attached.sessionId) throw failure('无法连接指定 Chrome 标签页。', 'tab_gone');
-      entry = { sessionId: attached.sessionId };
-      await send(context, 'Runtime.enable', {}, entry.sessionId);
-      await send(context, 'Page.enable', {}, entry.sessionId);
+      // Install the entry before awaiting attachment. Workers can share the
+      // bound account tab without opening duplicate CDP sessions for it.
+      entry = { sessionId: null, ready: null };
       context.sessions.set(targetId, entry);
+      entry.ready = (async () => {
+        try {
+          const attached = await send(context, 'Target.attachToTarget', { targetId, flatten: true });
+          if (!attached.sessionId) throw failure('无法连接指定 Chrome 标签页。', 'tab_gone');
+          entry.sessionId = attached.sessionId;
+          await send(context, 'Runtime.enable', {}, entry.sessionId);
+          await send(context, 'Page.enable', {}, entry.sessionId);
+        } catch (error) {
+          if (context.sessions.get(targetId) === entry) context.sessions.delete(targetId);
+          throw error;
+        }
+      })();
     }
+    await entry.ready;
+    if (context.sessions.get(targetId) !== entry) throw failure('绑定的 Chrome 标签页已关闭，请重新绑定。', 'tab_gone');
     return { context, target, sessionId: entry.sessionId };
   }
 
-  async function active() {
-    const targetId = selected;
-    return targetSession(await connect(), targetId);
-  }
-
-  async function expression(handle, code, returnByValue = true) {
-    const result = await send(handle.context, 'Runtime.evaluate', {
-      expression: code, returnByValue, awaitPromise: true,
-    }, handle.sessionId);
-    if (result.exceptionDetails) throw failure(String(result.exceptionDetails.exception?.description || result.exceptionDetails.text || '网页操作失败。').slice(0, 500));
-    return returnByValue ? result.result?.value : result.result;
-  }
-
-  async function evaluate(fn, arg) {
-    return expression(await active(), `(${fn.toString()})(${JSON.stringify(arg ?? null)})`);
-  }
-
-  async function tabs() {
-    const context = await connect();
-    const { targetInfos = [] } = await send(context, 'Target.getTargets');
-    return targetInfos.filter(tab => ['page', 'webview'].includes(tab.type)).map(tab => ({
-      targetId: tab.targetId, title: tab.title, url: tab.url, active: tab.targetId === selected,
-    }));
-  }
-
-  async function select(targetId) {
-    selected = targetId;
-    const { target } = await active();
-    return { targetId: target.targetId, title: target.title, url: target.url, active: true };
-  }
-
-  async function openTab(url) {
-    const handle = await active();
-    const browserContextId = handle.target.browserContextId;
-    if (!browserContextId) throw failure('无法确认 Chrome 账号所属环境，未创建投稿标签页。', 'identity_mismatch');
-    // Open a uniquely identifiable empty page first. The real URL is visited
-    // only after checking that the new page belongs to the selected profile.
-    const markerUrl = `about:blank#pixiv-publisher-${randomUUID()}`;
-    let targetId;
-    try {
-      ({ targetId } = await send(handle.context, 'Target.createTarget', {
-        url: markerUrl, background: true, browserContextId,
-      }));
-    } catch (error) {
-      // Chrome's profile lookup supports only the last-used regular profile
-      // and CDP-created contexts. A page session uses the same global lookup.
-      // This exact rejection happens before creation; all other failures stay
-      // final because their result may be unknown.
-      if (error.message !== `Failed to find browser context with id ${browserContextId}`) throw error;
-      targetId = await openSiblingTab(handle, markerUrl);
+  function createDriver({ owner = false, initialTarget = null } = {}) {
+    // Every worker owns its cursor; transport, consent and target sessions stay
+    // shared. A fork never activates a window or creates another connection.
+    let selected = initialTarget, released = false;
+    const createdGeneration = generation;
+    function available() {
+      if (released || !owner && createdGeneration !== generation) throw failure('后台浏览器任务已关闭。', 'disconnected');
     }
-    if (!targetId) throw failure('Chrome 未返回新标签页，未重试创建。');
-    const created = await targetSession(handle.context, targetId);
-    if (created.target.browserContextId !== browserContextId) {
-      await send(handle.context, 'Target.closeTarget', { targetId }).catch(() => {});
-      handle.context.sessions.delete(targetId);
-      throw failure('新标签页的 Chrome 账号环境不一致，已停止操作。', 'identity_mismatch');
+
+    async function active() {
+      available();
+      const targetId = selected;
+      return targetSession(await connect(), targetId);
     }
-    // Pixiv can defer interactive widgets on a background page. Emulate an
-    // active document on this dedicated, verified tab only; this CDP command
-    // does not activate the Chrome tab or bring its window to the foreground.
-    // A rejection stays final: never substitute real window activation.
-    await send(handle.context, 'Emulation.setFocusEmulationEnabled', { enabled: true }, created.sessionId);
-    const navigation = await send(handle.context, 'Page.navigate', { url }, created.sessionId);
-    if (navigation.errorText) throw failure(`投稿页面未能打开：${navigation.errorText}`);
-    // Navigation acknowledgement can precede the target URL update. Wait only
-    // for this new tab to leave its marker; never repeat the navigation.
-    const deadline = Date.now() + Math.min(timeoutMs, 10000);
-    do {
-      const { target } = await targetSession(handle.context, targetId);
-      if (target.browserContextId !== browserContextId) throw failure('投稿标签页的 Chrome 账号环境已改变，已停止操作。', 'identity_mismatch');
-      if (target.url && target.url !== markerUrl && target.url !== 'about:blank') {
-        selected = targetId;
-        return { targetId: target.targetId, title: target.title, url: target.url, active: true };
-      }
-      if (Date.now() >= deadline) throw failure('等待投稿页面打开超时；未重复导航。', 'timeout');
-      await pause(100);
-    } while (true);
-  }
 
-  async function openSiblingTab(handle, markerUrl) {
-    const { targetInfos = [] } = await send(handle.context, 'Target.getTargets');
-    const existing = new Set(targetInfos.map(target => target.targetId));
-    const { frameTree } = await send(handle.context, 'Page.getFrameTree', {}, handle.sessionId);
-    if (!frameTree?.frame?.id) throw failure('无法确认原标签页，未创建后台投稿页。');
-    const { executionContextId } = await send(handle.context, 'Page.createIsolatedWorld', {
-      frameId: frameTree.frame.id, worldName: 'pixiv-publisher-background-tab',
-    }, handle.sessionId);
-    if (!executionContextId) throw failure('Chrome 无法建立隔离操作环境，未创建后台投稿页。');
-    // Blink explicitly preserves Ctrl/Meta-click's background-tab disposition
-    // for an isolated world (navigation_policy.cc). In the main world synthetic
-    // clicks become foreground tabs, so never substitute a normal evaluation.
-    const opened = await send(handle.context, 'Runtime.evaluate', {
-      expression: `(${openBackgroundLink.toString()})(${JSON.stringify(markerUrl)})`,
-      contextId: executionContextId, returnByValue: true, awaitPromise: true, userGesture: true,
-    }, handle.sessionId);
-    if (opened.exceptionDetails) throw failure('Chrome 未能创建后台投稿页；未重试创建。');
-    const deadline = Date.now() + Math.min(timeoutMs, 10000);
-    do {
-      const { targetInfos: currentTargets = [] } = await send(handle.context, 'Target.getTargets');
-      const matches = currentTargets.filter(target => !existing.has(target.targetId) && target.type === 'page' && target.url === markerUrl);
-      if (matches.length === 1) return matches[0].targetId;
-      if (matches.length > 1) throw failure('出现多个后台标签页，无法确认目标；已停止操作。');
-      if (Date.now() >= deadline) throw failure('未找到创建的后台投稿页；未重试创建。', 'timeout');
-      await pause(100);
-    } while (true);
-  }
+    async function expression(handle, code, returnByValue = true) {
+      const result = await send(handle.context, 'Runtime.evaluate', {
+        expression: code, returnByValue, awaitPromise: true,
+      }, handle.sessionId);
+      if (result.exceptionDetails) throw failure(String(result.exceptionDetails.exception?.description || result.exceptionDetails.text || '网页操作失败。').slice(0, 500));
+      return returnByValue ? result.result?.value : result.result;
+    }
 
-  async function command(args) {
-    const [action, selector, ...values] = args;
-    if (action === 'tab' && selector === 'list') return { tabs: await tabs() };
-    if (action === 'tab' && selector === 'close') {
-      const targetId = values[0] || selected;
+    async function evaluate(fn, arg) {
+      return expression(await active(), `(${fn.toString()})(${JSON.stringify(arg ?? null)})`);
+    }
+
+    async function tabs() {
+      available();
       const context = await connect();
-      await targetSession(context, targetId);
-      await send(context, 'Target.closeTarget', { targetId });
-      context.sessions.delete(targetId);
-      if (selected === targetId) selected = null;
-      return { closed: true, targetId };
+      const { targetInfos = [] } = await send(context, 'Target.getTargets');
+      return targetInfos.filter(tab => ['page', 'webview'].includes(tab.type)).map(tab => ({
+        targetId: tab.targetId, title: tab.title, url: tab.url, active: tab.targetId === selected,
+      }));
     }
-    const handle = await active();
-    if (action === 'wait' && selector === '--fn') {
-      const deadline = Date.now() + timeoutMs;
+
+    async function select(targetId) {
+      available();
+      selected = targetId;
+      const { target } = await active();
+      return { targetId: target.targetId, title: target.title, url: target.url, active: true };
+    }
+
+    async function openTab(url) {
+      available();
+      // Only an explicitly managed Chrome can bootstrap a page in its default
+      // context. Legacy Chrome still requires a selected, identified profile.
+      let handle, bootstrapContext = false;
+      if (dedicated && !selected) {
+        const context = await connect();
+        const { targetInfos = [] } = await send(context, 'Target.getTargets');
+        const pages = targetInfos.filter(target => ['page', 'webview'].includes(target.type));
+        const source = pages.find(target => target.url === 'about:blank') || pages[0];
+        // Even the managed process's default profile can have a nonempty CDP
+        // context ID. Prefer its existing blank startup page as the anchor.
+        if (source) handle = await targetSession(context, source.targetId);
+        else { handle = { context, target: {} }; bootstrapContext = true; }
+      } else handle = await active();
+      let browserContextId = handle.target.browserContextId;
+      if (!browserContextId && !dedicated) throw failure('无法确认 Chrome 账号所属环境，未创建投稿标签页。', 'identity_mismatch');
+      // Open a uniquely identifiable empty page first. The real URL is visited
+      // only after checking that the new page belongs to the selected profile.
+      const markerUrl = `about:blank#pixiv-publisher-${randomUUID()}`;
+      let targetId;
+      try {
+        ({ targetId } = await send(handle.context, 'Target.createTarget', {
+          url: markerUrl, background: true, ...(browserContextId ? { browserContextId } : {}),
+        }));
+      } catch (error) {
+        // Chrome's profile lookup supports only the last-used regular profile
+        // and CDP-created contexts. A page session uses the same global lookup.
+        // This exact rejection happens before creation; all other failures stay
+        // final because their result may be unknown.
+        if (!browserContextId || error.message !== `Failed to find browser context with id ${browserContextId}`) throw error;
+        targetId = await openSiblingTab(handle, markerUrl);
+      }
+      if (!targetId) throw failure('Chrome 未返回新标签页，未重试创建。');
+      const created = await targetSession(handle.context, targetId);
+      // With no existing page, only the explicitly managed process may create
+      // a default-context marker and adopt its observed context before visiting
+      // the requested URL. Keep that exact context pinned during navigation.
+      if (bootstrapContext) browserContextId = created.target.browserContextId;
+      if ((created.target.browserContextId || null) !== (browserContextId || null)) {
+        await send(handle.context, 'Target.closeTarget', { targetId }).catch(() => {});
+        handle.context.sessions.delete(targetId);
+        throw failure('新标签页的 Chrome 账号环境不一致，已停止操作。', 'identity_mismatch');
+      }
+      // Pixiv can defer interactive widgets on a background page. Emulate an
+      // active document on this dedicated, verified tab only; this CDP command
+      // does not activate the Chrome tab or bring its window to the foreground.
+      // A rejection stays final: never substitute real window activation.
+      await send(handle.context, 'Emulation.setFocusEmulationEnabled', { enabled: true }, created.sessionId);
+      const navigation = await send(handle.context, 'Page.navigate', { url }, created.sessionId);
+      if (navigation.errorText) throw failure(`投稿页面未能打开：${navigation.errorText}`);
+      // Navigation acknowledgement can precede the target URL update. Wait only
+      // for this new tab to leave its marker; never repeat the navigation.
+      const deadline = Date.now() + Math.min(timeoutMs, 10000);
       do {
-        if (await expression(handle, `Boolean(${values[0]})`)) return { success: true };
-        if (Date.now() >= deadline) throw failure('等待网页状态超时。', 'timeout');
+        const { target } = await targetSession(handle.context, targetId);
+        if ((target.browserContextId || null) !== (browserContextId || null)) throw failure('投稿标签页的 Chrome 账号环境已改变，已停止操作。', 'identity_mismatch');
+        if (target.url && target.url !== markerUrl && target.url !== 'about:blank') {
+          selected = targetId;
+          return { targetId: target.targetId, title: target.title, url: target.url, active: true };
+        }
+        if (Date.now() >= deadline) throw failure('等待投稿页面打开超时；未重复导航。', 'timeout');
         await pause(100);
       } while (true);
     }
-    if (action === 'upload') {
-      const object = await expression(handle, `(() => { const nodes = document.querySelectorAll(${JSON.stringify(selector)}); if (nodes.length !== 1 || nodes[0].type !== 'file') throw new Error('找不到唯一的图片上传控件。'); return nodes[0]; })()`, false);
-      if (!object?.objectId || object.subtype === 'null') throw failure('找不到图片上传控件。');
-      try { await send(handle.context, 'DOM.setFileInputFiles', { files: values, objectId: object.objectId }, handle.sessionId); }
-      finally { if (!handle.context.closed) await send(handle.context, 'Runtime.releaseObject', { objectId: object.objectId }, handle.sessionId).catch(() => {}); }
-      return { uploaded: values.length };
+
+    async function openSiblingTab(handle, markerUrl) {
+      const { targetInfos = [] } = await send(handle.context, 'Target.getTargets');
+      const existing = new Set(targetInfos.map(target => target.targetId));
+      const { frameTree } = await send(handle.context, 'Page.getFrameTree', {}, handle.sessionId);
+      if (!frameTree?.frame?.id) throw failure('无法确认原标签页，未创建后台投稿页。');
+      const { executionContextId } = await send(handle.context, 'Page.createIsolatedWorld', {
+        frameId: frameTree.frame.id, worldName: 'pixiv-publisher-background-tab',
+      }, handle.sessionId);
+      if (!executionContextId) throw failure('Chrome 无法建立隔离操作环境，未创建后台投稿页。');
+      // Blink explicitly preserves Ctrl/Meta-click's background-tab disposition
+      // for an isolated world (navigation_policy.cc). In the main world synthetic
+      // clicks become foreground tabs, so never substitute a normal evaluation.
+      const opened = await send(handle.context, 'Runtime.evaluate', {
+        expression: `(${openBackgroundLink.toString()})(${JSON.stringify(markerUrl)})`,
+        contextId: executionContextId, returnByValue: true, awaitPromise: true, userGesture: true,
+      }, handle.sessionId);
+      if (opened.exceptionDetails) throw failure('Chrome 未能创建后台投稿页；未重试创建。');
+      const deadline = Date.now() + Math.min(timeoutMs, 10000);
+      do {
+        const { targetInfos: currentTargets = [] } = await send(handle.context, 'Target.getTargets');
+        const matches = currentTargets.filter(target => !existing.has(target.targetId) && target.type === 'page' && target.url === markerUrl);
+        if (matches.length === 1) return matches[0].targetId;
+        if (matches.length > 1) throw failure('出现多个后台标签页，无法确认目标；已停止操作。');
+        if (Date.now() >= deadline) throw failure('未找到创建的后台投稿页；未重试创建。', 'timeout');
+        await pause(100);
+      } while (true);
     }
-    if (!['fill', 'check', 'uncheck', 'click'].includes(action)) throw failure(`后台浏览器不支持此操作：${action}`);
-    return expression(handle, `(${interact.toString()})(${JSON.stringify({ action, selector, value: values[0] ?? '' })})`);
+
+    async function command(args) {
+      available();
+      const [action, selector, ...values] = args;
+      if (action === 'tab' && selector === 'list') return { tabs: await tabs() };
+      if (action === 'tab' && selector === 'close') {
+        const targetId = values[0] || selected;
+        const context = await connect();
+        await targetSession(context, targetId);
+        await send(context, 'Target.closeTarget', { targetId });
+        context.sessions.delete(targetId);
+        if (selected === targetId) selected = null;
+        return { closed: true, targetId };
+      }
+      const handle = await active();
+      if (action === 'wait' && selector === '--fn') {
+        const deadline = Date.now() + timeoutMs;
+        do {
+          if (await expression(handle, `Boolean(${values[0]})`)) return { success: true };
+          if (Date.now() >= deadline) throw failure('等待网页状态超时。', 'timeout');
+          await pause(100);
+        } while (true);
+      }
+      if (action === 'upload') {
+        const object = await expression(handle, `(() => { const nodes = document.querySelectorAll(${JSON.stringify(selector)}); if (nodes.length !== 1 || nodes[0].type !== 'file') throw new Error('找不到唯一的图片上传控件。'); return nodes[0]; })()`, false);
+        if (!object?.objectId || object.subtype === 'null') throw failure('找不到图片上传控件。');
+        try { await send(handle.context, 'DOM.setFileInputFiles', { files: values, objectId: object.objectId }, handle.sessionId); }
+        finally { if (!handle.context.closed) await send(handle.context, 'Runtime.releaseObject', { objectId: object.objectId }, handle.sessionId).catch(() => {}); }
+        return { uploaded: values.length };
+      }
+      if (!['fill', 'check', 'uncheck', 'click'].includes(action)) throw failure(`后台浏览器不支持此操作：${action}`);
+      return expression(handle, `(${interact.toString()})(${JSON.stringify({ action, selector, value: values[0] ?? '' })})`);
+    }
+
+    function close() {
+      if (owner) {
+        generation++;
+        if (current) abandon(current, failure('Chrome 连接已关闭。', 'disconnected'));
+      } else released = true;
+      selected = null;
+    }
+    function fork() {
+      available();
+      return createDriver({ initialTarget: selected });
+    }
+    return { tabs, select, evaluate, openTab, command, close, fork };
   }
 
-  function close() {
-    if (current) abandon(current, failure('Chrome 连接已关闭。', 'disconnected'));
-    selected = null;
-  }
-  return { tabs, select, evaluate, openTab, command, close };
+  return createDriver({ owner: true });
 }
 
 function openBackgroundLink(url) {

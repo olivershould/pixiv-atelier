@@ -17,7 +17,7 @@ export function createDemoState(now = new Date()) {
     { id: 'demo-sketch', name: '日常速写', pixivUserId: '演示账号 02', avatarColor: '#bf927c' },
     { id: 'demo-archive', name: '灵感收藏夹', pixivUserId: '演示账号 03', avatarColor: '#8d9bac' },
   ].map(account => ({ ...account, demo: true, connected: true, paused: false, premium: true,
-    timezone: 'Asia/Shanghai', remote: { syncOk: true, syncedAt: stamp, total: 0, reservations: [] } }));
+    timezone: 'Asia/Shanghai', remote: { syncOk: true, complete: true, syncedAt: stamp, total: 0, reservations: [] } }));
   // All thirty works belong to one account, so the ten-slot rolling limit is visible.
   const titles = ['风经过的夏天', '海边来信', '午后的光', '蓝色假日', '山间慢行', '云的方向', '下一站晴天', '窗边植物', '晚风与灯', '微小的日常'];
   const localDay = new Date(time.getTime() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);

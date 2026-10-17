@@ -50,6 +50,7 @@ async function fixture(t, records = [record()]) {
 
 test('confirmed missing reservation is uniquely verified, persists actual publication time, and releases local occupancy', async t => {
   const f = await fixture(t);
+  f.fake.details['200'] = fullPublished();
   const snapshot = await f.connector.snapshot(account, { jobs: [job()] });
   assert.equal(snapshot.total, 0);
   assert.deepEqual(snapshot.reservations.map(row => [row.status, row.artworkId, row.publishedAt, row.publicationVerifiedAt]), [['published', '200', WHEN, NOW]]);
@@ -125,11 +126,11 @@ test('blank original title accepts only Pixiv untitled representations', async t
 test('multiple matching artworks and one matching artwork for two jobs both stay ambiguous', async t => {
   const f = await fixture(t); f.fake.ids.push('201'); f.fake.details['201'] = published('201');
   const snapshot = await f.connector.snapshot(account);
-  assert.deepEqual(snapshot.reservations, []); assert.equal(snapshot.publicationChecks[0].reason, 'ambiguous_match');
+  assert.deepEqual(snapshot.reservations, []); assert.equal(snapshot.publicationChecks[0].reason, 'publication_evidence_missing');
   const paired = await fixture(t, [record(), record('second')]);
   const result = await paired.connector.snapshot(account);
   assert.deepEqual(result.reservations, []);
-  assert.deepEqual(result.publicationChecks.map(row => row.reason), ['ambiguous_match', 'ambiguous_match']);
+  assert.deepEqual(result.publicationChecks.map(row => row.reason), ['publication_evidence_missing', 'publication_evidence_missing']);
 });
 
 test('a competing uncertain submission or legacy row without baseline also prevents false attribution', async t => {
@@ -138,8 +139,122 @@ test('a competing uncertain submission or legacy row without baseline also preve
     const f = await fixture(t, [record(), other]);
     const snapshot = await f.connector.snapshot(account);
     assert.deepEqual(snapshot.reservations, []);
-    assert.equal(snapshot.publicationChecks.find(row => row.jobId === 'job').reason, 'ambiguous_match');
+    assert.equal(snapshot.publicationChecks.find(row => row.jobId === 'job').reason, 'publication_evidence_missing');
   }
+});
+
+const withEvidence = (id = 'job', tags = ['Robin'], xRestrict = 0) => {
+  const value = record(id); Object.assign(value.publicationExpected, { tags, xRestrict }); return value;
+};
+const fullPublished = (id = '200', tags = ['Robin'], xRestrict = 0) => published(id, { tags, xRestrict });
+
+test('exact immutable job links upgrade old records and separate same-minute works by complete tag sets', async t => {
+  const f = await fixture(t, [record(), record('second')]);
+  f.fake.ids.push('201'); f.fake.details = { '200': fullPublished('200', ['Robin', 'smile']), '201': fullPublished('201') };
+  const jobs = [job(), { ...job('second'), tags: ['smile', 'Robin'] }];
+  const snapshot = await f.connector.snapshot(account, { jobs });
+  assert.deepEqual(snapshot.reservations.map(row => [row.jobId, row.artworkId]), [['job', '201'], ['second', '200']]);
+  assert.ok(snapshot.publicationChecks.every(row => row.status === 'published' && row.checkedAt === NOW));
+  const saved = await f.readLedger();
+  assert.deepEqual(saved[hash('key-second')].publicationExpected.tags, ['Robin', 'smile']);
+  assert.equal(saved[hash('key-job')].publicationCheck.artworkId, '201');
+  const restarted = await f.restart(); f.fake.calls.length = 0;
+  const again = await restarted.snapshot(account, { jobs: jobs.map(row => ({ ...row, tags: ['changed'] })) });
+  assert.deepEqual(again.reservations.map(row => row.artworkId), ['201', '200']);
+  assert.equal(f.fake.calls.some(call => call.name === 'readPublished'), false);
+});
+
+test('complete equal tag sets can be distinguished by the frozen age rating', async t => {
+  const f = await fixture(t, [withEvidence(), withEvidence('second', ['Robin'], 1)]);
+  f.fake.ids.push('201'); f.fake.details = { '200': fullPublished('200', ['Robin'], 1), '201': fullPublished('201') };
+  const snapshot = await f.connector.snapshot(account);
+  assert.deepEqual(snapshot.reservations.map(row => [row.jobId, row.artworkId]), [['job', '201'], ['second', '200']]);
+});
+
+test('same complete evidence remains ambiguous and never pairs by reservation or artwork order', async t => {
+  const f = await fixture(t, [withEvidence(), withEvidence('second')]);
+  f.fake.ids.push('201'); f.fake.details['200'] = fullPublished(); f.fake.details['201'] = fullPublished('201');
+  const snapshot = await f.connector.snapshot(account);
+  assert.deepEqual(snapshot.reservations, []);
+  assert.ok(snapshot.publicationChecks.every(row => row.reason === 'ambiguous_match'));
+  const saved = await f.readLedger();
+  assert.equal(saved[hash('key-job')].publicationCheck.checkedAt, NOW);
+  assert.equal(saved[hash('key-job')].publicationCheck.reason, 'ambiguous_match');
+});
+
+test('an unmatched work cannot bypass frozen evidence after its rival is published on an earlier sync', async t => {
+  const f = await fixture(t, [withEvidence('job', ['first']), withEvidence('second', ['second'])]);
+  f.fake.ids.push('201'); f.fake.details = { '200': fullPublished('200', ['first']), '201': fullPublished('201', ['edited']) };
+  const first = await f.connector.snapshot(account);
+  assert.deepEqual(first.reservations.map(row => [row.jobId, row.artworkId]), [['job', '200']]);
+  assert.equal(first.publicationChecks.find(row => row.jobId === 'second').reason, 'publication_evidence_mismatch');
+  const restarted = await f.restart(), second = await restarted.snapshot(account);
+  assert.deepEqual(second.reservations.map(row => [row.jobId, row.artworkId]), [['job', '200']]);
+  assert.equal(second.publicationChecks.find(row => row.jobId === 'second').reason, 'publication_evidence_mismatch');
+  assert.equal((await f.readLedger())[hash('key-second')].phase, 'confirmed');
+  const partial = record(); partial.publicationExpected.tags = ['Robin'];
+  const incomplete = await fixture(t, [partial]); incomplete.fake.details['200'] = fullPublished();
+  const result = await incomplete.connector.snapshot(account, { jobs: [job()] });
+  assert.deepEqual(result.reservations, []);
+  assert.equal(result.publicationChecks[0].reason, 'publication_evidence_missing');
+  assert.equal((await incomplete.readLedger())[hash('key-job')].publicationExpected.xRestrict, undefined);
+});
+
+test('missing or edited remote evidence preserves uncertainty across all matching candidates', async t => {
+  for (const patch of [{ tags: null }, { tags: undefined }, { xRestrict: null }, { xRestrict: '0' }, { tags: ['other'] }, { xRestrict: 2 }]) {
+    const f = await fixture(t, [withEvidence()]); f.fake.ids.push('201');
+    f.fake.details = { '200': { ...fullPublished(), ...patch }, '201': fullPublished('201', ['different']) };
+    const snapshot = await f.connector.snapshot(account);
+    assert.deepEqual(snapshot.reservations, [], JSON.stringify(patch));
+    assert.ok(['publication_evidence_missing', 'publication_evidence_mismatch'].includes(snapshot.publicationChecks[0].reason));
+  }
+  const f = await fixture(t, [withEvidence()]); f.fake.ids.push('201');
+  f.fake.details = { '200': fullPublished(), '201': published('201') };
+  assert.deepEqual((await f.connector.snapshot(account)).reservations, [], 'one unreadable rival cannot be excluded');
+});
+
+test('evidence backfill requires one exact job identity, base metadata and original account', async t => {
+  for (const patch of [{ accountId: 'elsewhere' }, { id: 'wrong-job' }, { idempotencyKey: 'different-attempt' }, { remoteId: 'illust:999' },
+    { pixivUserId: '202' }, { title: 'Different' }, { scheduledAt: BEFORE }, { files: [{}, {}] },
+    { content: { ...job().content, type: 'manga' } }, { status: 'draft' }, { tagsConfirmed: false }]) {
+    const f = await fixture(t); f.fake.ids.push('201');
+    f.fake.details = { '200': fullPublished(), '201': fullPublished('201', ['different']) };
+    const snapshot = await f.connector.snapshot(account, { jobs: [{ ...job(), ...patch }] });
+    assert.deepEqual(snapshot.reservations, [], JSON.stringify(patch));
+    assert.equal(Object.hasOwn((await f.readLedger())[hash('key-job')].publicationExpected, 'tags'), false);
+  }
+  const duplicate = await fixture(t); duplicate.fake.ids.push('201');
+  duplicate.fake.details = { '200': fullPublished(), '201': fullPublished('201', ['different']) };
+  assert.deepEqual((await duplicate.connector.snapshot(account, { jobs: [job(), job()] })).reservations, []);
+});
+
+test('frozen evidence cannot be overwritten and a missing publication baseline cannot be manufactured', async t => {
+  const f = await fixture(t, [withEvidence('job', ['original'])]); f.fake.ids.push('201');
+  f.fake.details = { '200': fullPublished(), '201': fullPublished('201', ['different']) };
+  assert.deepEqual((await f.connector.snapshot(account, { jobs: [job()] })).reservations, []);
+  assert.deepEqual((await f.readLedger())[hash('key-job')].publicationExpected.tags, ['original']);
+  const malformed = withEvidence(); malformed.publicationExpected.pageCount = null;
+  const broken = await fixture(t, [malformed]);
+  assert.deepEqual((await broken.connector.snapshot(account, { jobs: [job()] })).reservations, []);
+  assert.equal((await broken.readLedger())[hash('key-job')].publicationExpected.pageCount, null);
+  const old = record(); delete old.publishedBaselineIds; delete old.publicationBaselineAt;
+  const missing = await fixture(t, [old]);
+  const result = await missing.connector.snapshot(account, { jobs: [job()] });
+  assert.equal(result.publicationChecks[0].reason, 'baseline_missing');
+  assert.equal((await missing.readLedger())[hash('key-job')].publishedBaselineIds, undefined);
+});
+
+test('unknown competing submissions block attribution unless their complete frozen evidence excludes it', async t => {
+  for (const enhanced of [false, true]) {
+    const unknown = enhanced ? withEvidence('second', ['different']) : record('second'); unknown.phase = 'unknown';
+    const f = await fixture(t, [withEvidence(), unknown]); f.fake.details['200'] = fullPublished();
+    const snapshot = await f.connector.snapshot(account, { jobs: [job('second')] });
+    assert.equal(snapshot.reservations.length, enhanced ? 1 : 0);
+    if (!enhanced) assert.equal(snapshot.publicationChecks[0].reason, 'ambiguous_match');
+  }
+  const other = withEvidence('second'); other.pixivUserId = '202';
+  const f = await fixture(t, [withEvidence(), other]); f.fake.details['200'] = fullPublished();
+  assert.equal((await f.connector.snapshot(account)).reservations[0].artworkId, '200');
 });
 
 test('manga lives in the illust reservation stream but must match manga detail type', async t => {
@@ -169,6 +284,7 @@ test('failed candidate, incomplete full index, and excessive candidate count pre
 
 test('avatar best effort does not invalidate publication evidence or trigger any clicks', async t => {
   const f = await fixture(t); const evaluate = f.fake.evaluate;
+  f.fake.details['200'] = fullPublished();
   f.fake.evaluate = (fn, args) => fn.name === 'readAccountAvatar' ? Promise.reject(new Error('offline')) : evaluate(fn, args);
   assert.equal((await f.connector.snapshot(account, { jobs: [job()] })).reservations[0].status, 'published');
 });
@@ -197,7 +313,7 @@ test('new submissions persist exact metadata and complete baseline before clicki
         clicks++;
         const saved = (await f.readLedger())[hash('new-attempt')];
         assert.deepEqual(saved.publishedBaselineIds, ['100']);
-        assert.deepEqual(saved.publicationExpected, record().publicationExpected);
+        assert.deepEqual(saved.publicationExpected, { ...record().publicationExpected, tags: ['Robin'], xRestrict: 0 });
         assert.equal(saved.phase, 'submitting');
         throw new Error('transport fails after click');
       }
@@ -283,4 +399,17 @@ test('published detail driver rejects drafts/reservations and foreign ownership 
   }
   const result = await driverPage({ body: base }).run(readPublished, { artworkId: '200' });
   assert.equal(result.createDate, WHEN); assert.equal(result.illustType, 0);
+});
+
+test('published detail exports only complete exact tags and numeric rating; missing values stay unknown', async () => {
+  const base = { id: '200', userId: '101', title: 'Robin', pageCount: 1, createDate: WHEN, illustType: 0,
+    tags: { tags: [{ tag: 'smile' }, { tag: 'Robin' }] }, xRestrict: 0 };
+  const result = await driverPage({ body: base }).run(readPublished, { artworkId: '200' });
+  assert.deepEqual([...result.tags], ['Robin', 'smile']); assert.equal(result.xRestrict, 0);
+  for (const tags of [undefined, { tags: [{ tag: 'Robin' }, {}] }, { tags: [{ tag: 'Robin' }, { tag: 'Robin' }] }, { tags: [{ tag: '' }] }]) {
+    assert.equal((await driverPage({ body: { ...base, tags } }).run(readPublished, { artworkId: '200' })).tags, null);
+  }
+  for (const xRestrict of [undefined, null, '0', 3, -1]) {
+    assert.equal((await driverPage({ body: { ...base, xRestrict } }).run(readPublished, { artworkId: '200' })).xRestrict, null);
+  }
 });

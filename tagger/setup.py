@@ -20,6 +20,26 @@ RUNTIME = ROOT / ".runtime" / "tagger"
 MODELS = ROOT / ".data" / "models" / "wd-swinv2-v3"
 
 
+def configuration_path(value):
+    """Keep project-owned files movable; explicit external Python stays absolute."""
+    candidate = Path(value)
+    resolved = (candidate if candidate.is_absolute() else ROOT / candidate).resolve()
+    try:
+        return resolved.relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def build_configuration(manifest):
+    return {
+        "pythonPath": configuration_path(sys.executable),
+        "runtimeDir": configuration_path(RUNTIME),
+        "modelDir": configuration_path(MODELS),
+        "modelRevision": manifest["modelVersion"],
+        "configuredAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def digest(path):
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
@@ -43,14 +63,25 @@ def atomic_json(path, value):
     os.replace(temporary, path)
 
 
+def ensure_pip():
+    probe = subprocess.run([sys.executable, "-I", "-m", "pip", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if probe.returncode == 0:
+        return
+    if not Path(sys.executable).resolve().is_relative_to((ROOT / ".runtime" / "python").resolve()):
+        raise RuntimeError("This Python has no pip. Use the project .runtime/python interpreter, or install pip for your chosen Python first.")
+    # Bootstrap only the application's own interpreter, never an external one.
+    subprocess.run([sys.executable, "-I", "-m", "ensurepip", "--default-pip"], check=True)
+
+
 def install_dependencies(manifest):
     if sys.version_info < (3, 10):
         raise RuntimeError("Python 3.10 or newer is required; tested target is Python 3.12 x64")
+    ensure_pip()
     RUNTIME.parent.mkdir(parents=True, exist_ok=True)
     stage = RUNTIME.with_name("tagger.install-" + uuid.uuid4().hex)
     pins = [f"{name}=={version}" for name, version in manifest["dependencies"].items()]
     print(f"Installing pinned wheels into project staging directory: {stage}", flush=True)
-    command = [sys.executable, "-m", "pip", "--isolated", "--disable-pip-version-check", "--no-cache-dir", "install", "--index-url", "https://pypi.org/simple", "--only-binary=:all:", "--no-deps", "--target", str(stage), *pins]
+    command = [sys.executable, "-I", "-m", "pip", "--isolated", "--disable-pip-version-check", "--no-cache-dir", "install", "--index-url", "https://pypi.org/simple", "--only-binary=:all:", "--no-deps", "--target", str(stage), *pins]
     try:
         subprocess.run(command, check=True)
         check = "import sys;sys.path.insert(0,sys.argv[1]);import numpy,onnxruntime;from PIL import Image;print('Local dependency imports passed')"
@@ -142,7 +173,7 @@ def download_file(item):
 
 def verify():
     environment = dict(os.environ, TAGGER_RUNTIME=str(RUNTIME), TAGGER_MODEL_DIR=str(MODELS), PYTHONDONTWRITEBYTECODE="1")
-    result = subprocess.run([sys.executable, "-u", str(Path(__file__).with_name("worker.py")), "--health"], env=environment, text=True, encoding="utf-8", capture_output=True, timeout=180)
+    result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-u", str(Path(__file__).with_name("worker.py")), "--health"], env=environment, text=True, encoding="utf-8", capture_output=True, timeout=180)
     if result.stderr:
         print(result.stderr, file=sys.stderr, end="")
     try:
@@ -177,13 +208,7 @@ def main():
         both_present = RUNTIME.is_dir() and all((MODELS / item["name"]).is_file() for item in manifest["files"])
         if args.verify or both_present:
             health = verify()
-            configuration = {
-                "pythonPath": sys.executable,
-                "runtimeDir": str(RUNTIME),
-                "modelDir": str(MODELS),
-                "modelRevision": manifest["modelVersion"],
-                "configuredAt": datetime.now(timezone.utc).isoformat(),
-            }
+            configuration = build_configuration(manifest)
             atomic_json(ROOT / ".data" / "tagger-config.json", configuration)
             print(json.dumps({"ready": True, "configuration": configuration, "health": health}, ensure_ascii=False, indent=2))
         else:

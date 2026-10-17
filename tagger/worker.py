@@ -139,7 +139,7 @@ def configured_path(name: str, fallback: Path) -> Path:
     value = os.environ.get(name)
     path = Path(value) if value else fallback
     if not path.is_absolute():
-        raise TaggerError("CONFIG_INVALID", f"{name} must be an absolute path")
+        path = ROOT / path
     return path.resolve()
 
 

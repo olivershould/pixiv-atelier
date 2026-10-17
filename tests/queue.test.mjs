@@ -1,12 +1,40 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { planReservations, reconcileRemote, validateJob, SNAPSHOT_MAX_AGE_MS, UPLOAD_TIMEOUT_MS } from '../server/queue.mjs';
+import { planReservations, reconcileRemote as reconcileSnapshot, validateJob, SNAPSHOT_MAX_AGE_MS, UPLOAD_TIMEOUT_MS } from '../server/queue.mjs';
 
 const NOW = '2026-10-04T00:00:00.000Z';
-const account = (id = 'a', overrides = {}) => ({ id, connected: true, paused: false, premium: true, remote: { syncOk: true, syncedAt: NOW, total: 0, reservations: [] }, ...overrides });
+const account = (id = 'a', overrides = {}) => ({ id, connected: true, paused: false, premium: true, ...overrides,
+  remote: { syncOk: true, complete: true, syncedAt: NOW, total: 0, reservations: [], ...overrides.remote } });
+const reconcileRemote = (state, id, snapshot, now) => reconcileSnapshot(state, id, { complete: true, ...snapshot }, now);
 const job = (id = 'j1', overrides = {}) => ({ id, accountId: 'a', title: '作品', tags: ['オリジナル'], tagsConfirmed: true, files: [{ id: 'image', name: 'image.png', size: 1 }], content: { type: 'illust', aiGenerated: false, rating: 'all', sexualContent: false, visibility: 'public' }, timezone: 'Asia/Shanghai', scheduledAt: '2026-10-05T00:00:00Z', status: 'queued', ...overrides });
 const state = (jobs = [job()], accounts = [account()]) => ({ accounts, jobs, settings: { keep: true }, logs: [] });
 const reserve = (current, actions) => ({ ...current, jobs: current.jobs.map(item => { const action = actions.find(value => value.jobId === item.id); return action ? { ...item, status: 'uploading', idempotencyKey: action.idempotencyKey, uploadStartedAt: NOW } : item; }) });
+
+test('publication diagnostics require matching verified identity and cannot establish publication', () => {
+  const current = state([job('review', { status: 'needs_review', reviewReason: 'reservation_missing_remotely', remoteId: 'illust:55' })], [account('a', { pixivUserId: '101' })]);
+  const check = { jobId: 'review', remoteId: 'illust:55', status: 'pending', reason: 'ambiguous_match', checkedAt: NOW, secret: 'discard' };
+  const snapshot = { ok: true, complete: true, total: 0, reservations: [], pixivUserId: '101', publicationChecks: [check] };
+  const updated = reconcileRemote(current, 'a', snapshot, NOW);
+  assert.equal(updated.jobs[0].status, 'needs_review');
+  assert.deepEqual(updated.jobs[0].publicationCheck, { jobId: 'review', remoteId: 'illust:55', status: 'pending', reason: 'ambiguous_match', checkedAt: NOW });
+  for (const changes of [{ pixivUserId: 'other' }, { pixivUserId: undefined }, { complete: false }, { ok: false },
+    { publicationChecks: [check, check] }, { publicationChecks: [{ ...check, remoteId: 'illust:other' }] },
+    { publicationChecks: [{ ...check, checkedAt: '2026-10-05T00:00:00Z' }] }, { publicationChecks: [{ ...check, status: 'published', artworkId: '200' }] }]) {
+    const result = reconcileRemote(current, 'a', { ...snapshot, ...changes }, NOW);
+    assert.equal(result.jobs[0].publicationCheck, undefined); assert.equal(result.jobs[0].status, 'needs_review');
+  }
+  const stale = reconcileRemote(updated, 'a', { ...snapshot, publicationChecks: [{ ...check, reason: 'candidate_read_failed', checkedAt: '2026-10-03T00:00:00Z' }] }, NOW);
+  assert.deepEqual(stale.jobs[0].publicationCheck, updated.jobs[0].publicationCheck);
+});
+
+test('verified publication clears pending diagnostics and retains the actual verification time', () => {
+  const check = { status: 'pending', reason: 'ambiguous_match', checkedAt: NOW };
+  const current = state([job('review', { status: 'needs_review', remoteId: 'illust:55', scheduledAt: NOW, publicationCheck: check })], [account('a', { pixivUserId: '101' })]);
+  const result = reconcileRemote(current, 'a', { ok: true, total: 0, complete: true, pixivUserId: '101', reservations: [{ remoteId: 'illust:55', jobId: 'review',
+    status: 'published', scheduledAt: NOW, artworkId: '200', pixivUserId: '101', publishedAt: NOW, publicationVerifiedAt: NOW }] }, NOW);
+  assert.equal(result.jobs[0].status, 'published'); assert.equal(result.jobs[0].artworkId, '200');
+  assert.equal(result.jobs[0].publicationCheck, undefined); assert.equal(result.jobs[0].publicationVerifiedAt, NOW);
+});
 
 test('30 works roll through three confirmed batches of ten', () => {
   const jobs = Array.from({ length: 30 }, (_, index) => job(`j${String(index).padStart(2, '0')}`, { scheduledAt: `2026-10-0${5 + Math.floor(index / 10)}T00:00:00Z` }));
@@ -37,7 +65,8 @@ test('eleventh work waits and uploading holds cannot be dispatched again', () =>
 });
 
 test('capacity is isolated per account and includes external reservations', () => {
-  const current = state([job('a1'), job('a2'), job('b1', { accountId: 'b' })], [account('a', { remote: { syncOk: true, syncedAt: NOW, total: 9, reservations: [{ id: 'external', status: 'reserved' }] } }), account('b')]);
+  const current = state([job('a1'), job('a2'), job('b1', { accountId: 'b' })], [account('a', { remote: { syncOk: true, syncedAt: NOW, total: 9,
+    reservations: Array.from({ length: 9 }, (_, i) => ({ id: 'external-' + i, status: 'reserved' })) } }), account('b')]);
   const planned = planReservations(current, NOW);
   assert.deepEqual(planned.actions.map(action => action.jobId), ['a1', 'b1']);
 });
@@ -115,6 +144,42 @@ test('malformed totals fail closed and uncertain local reservations continue occ
     const updated = reconcileRemote(current, 'a', { ok: true, total, reservations: [] }, NOW);
     assert.equal(updated.accounts[0].remote.syncOk, false);
   }
+});
+
+test('dispatch requires an exhaustive unique reservation list and rejects an explicit wrong Pixiv identity', () => {
+  const current = state(); current.accounts[0].pixivUserId = '101';
+  for (const remote of [
+    { complete: false }, { complete: undefined }, { total: 1 },
+    { total: 2, reservations: [{ id: 'same', status: 'reserved' }, { id: 'same', status: 'reserved' }] },
+    { total: 1, reservations: [{ status: 'reserved' }] },
+  ]) {
+    const candidate = structuredClone(current); Object.assign(candidate.accounts[0].remote, remote);
+    assert.equal(planReservations(candidate, NOW).actions.length, 0);
+  }
+  const wrong = reconcileRemote(current, 'a', { ok: true, complete: true, total: 0, reservations: [], pixivUserId: '999' }, NOW);
+  assert.equal(wrong.accounts[0].remote.syncOk, false); assert.equal(planReservations(wrong, NOW).actions.length, 0);
+  const legacy = reconcileRemote(current, 'a', { ok: true, complete: true, total: 0, reservations: [] }, NOW);
+  assert.equal(planReservations(legacy, NOW).actions.length, 1, 'Older external connectors may omit identity but must give a complete list.');
+});
+
+test('two in-flight local claims consume both remaining slots without double counting a newly visible claim', () => {
+  const initial = state([job('first'), job('second'), job('third')]);
+  initial.accounts[0].remote.reservations = Array.from({ length: 8 }, (_, i) => ({ id: 'outside-' + i, status: 'reserved' }));
+  initial.accounts[0].remote.total = 8;
+  const claims = planReservations(initial, NOW).actions;
+  assert.equal(claims.length, 2);
+  const claimed = reserve(initial, claims);
+  assert.equal(planReservations(claimed, NOW).actions.length, 0);
+  claimed.accounts[0].remote.reservations.push({ id: 'new', status: 'reserved', jobId: 'first', idempotencyKey: claims[0].idempotencyKey });
+  claimed.accounts[0].remote.total = 9;
+  assert.equal(planReservations(claimed, NOW).actions.length, 0);
+});
+
+test('duplicate local bindings of the same Pixiv identity cannot obtain independent ten-slot allowances', () => {
+  const current = state([job('a1'), job('b1', { accountId: 'b' })], [account('a', { pixivUserId: '101' }), account('b', { pixivUserId: '101' })]);
+  const plan = planReservations(current, NOW);
+  assert.equal(plan.actions.length, 0);
+  assert.ok(plan.reasons.every(reason => reason.code === 'duplicate_pixiv_account'));
 });
 
 test('post options require explicit AI, rating and all-age sexual-content choices', () => {

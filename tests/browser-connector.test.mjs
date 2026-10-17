@@ -149,7 +149,8 @@ test('adopting a changed remote schedule requires consent and the same previousl
  const {fake,dataDir}=await fixture(t);
  const idempotencyKey='existing-reservation',key=createHash('sha256').update(idempotencyKey).digest('hex');
  const job={...completeJob(),idempotencyKey,remoteId:'illust:55'};
- await fs.writeFile(path.join(dataDir,'browser-ledger.json'),JSON.stringify({[key]:{accountId:'local',pixivUserId:'101',jobId:job.id,idempotencyKey,remoteId:job.remoteId,scheduledAt:job.scheduledAt}}));
+ await fs.writeFile(path.join(dataDir,'browser-ledger.json'),JSON.stringify({[key]:{accountId:'local',pixivUserId:'101',jobId:job.id,idempotencyKey,remoteId:job.remoteId,scheduledAt:job.scheduledAt,
+  publicationExpected:{title:job.title,pageCount:1,illustType:0,scheduledAt:job.scheduledAt,tags:['frozen-submission-tag'],xRestrict:1}}}));
  const baseEvaluate=fake.evaluate;
  fake.evaluate=(fn,args)=>fn.name==='readRemote'?data('101',[{reserveId:'55',title:'测试',pageCount:1,releaseDate:'2026-10-14T09:00:00+09:00'},{reserveId:'56',title:'测试',pageCount:1,releaseDate:'2026-10-14T09:00:00+09:00'}]):baseEvaluate(fn,args);
  const connector=await createBrowserConnector({dataDir,driver:fake,now:()=>new Date(NOW)});
@@ -159,5 +160,7 @@ test('adopting a changed remote schedule requires consent and the same previousl
  const result=await connector.reconcile(account,job,{remoteId:'illust:55',adoptRemoteSchedule:true});
  assert.equal(result.reservations.find(r=>r.remoteId==='illust:55').scheduledAt,'2026-10-14T00:00:00.000Z');
  assert.equal(JSON.parse(await fs.readFile(path.join(dataDir,'browser-ledger.json'),'utf8'))[key].scheduledAt,'2026-10-14T00:00:00.000Z');
+ const savedExpected=JSON.parse(await fs.readFile(path.join(dataDir,'browser-ledger.json'),'utf8'))[key].publicationExpected;
+ assert.deepEqual(savedExpected.tags,['frozen-submission-tag']);assert.equal(savedExpected.xRestrict,1);
  assert.deepEqual(fake.commands,[], 'reconciliation never uploads or clicks');
 });

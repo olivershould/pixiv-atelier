@@ -62,6 +62,31 @@ function list(state, field) {
   return Array.isArray(state?.[field]) ? state[field] : [];
 }
 
+// A new side effect needs an exhaustive account snapshot. Older external
+// adapters may omit identity, but an explicitly conflicting identity is never
+// acceptable. Every active reservation must be represented exactly once.
+export function isCompleteRemoteSnapshot(snapshot, account) {
+  if (snapshot?.ok !== true || snapshot.complete !== true || !Number.isSafeInteger(snapshot.total) || snapshot.total < 0
+    || !Array.isArray(snapshot.reservations)) return false;
+  if (snapshot.pixivUserId !== undefined && snapshot.pixivUserId !== null
+    && String(snapshot.pixivUserId) !== String(account?.pixivUserId || '')) return false;
+  const ids = new Set();
+  for (const record of snapshot.reservations) {
+    const id = record?.remoteId || record?.id;
+    if (!record || typeof record !== 'object' || Array.isArray(record) || typeof record.status !== 'string' || !record.status.trim()) return false;
+    // Explicitly not-uploaded attempts may only have their idempotency key;
+    // they consume no remote slot. Active/unknown records require a remote ID.
+    const identity = typeof id === 'string' && id.trim() ? 'remote:' + id
+      : ['failed', 'cancelled'].includes(record.status) && typeof record.idempotencyKey === 'string' && record.idempotencyKey.trim()
+        ? 'attempt:' + record.idempotencyKey : null;
+    if (!identity || ids.has(identity)) return false;
+    if (record.accountId && record.accountId !== account.id) return false;
+    if (record.pixivUserId && String(record.pixivUserId) !== String(account.pixivUserId || '')) return false;
+    ids.add(identity);
+  }
+  return snapshot.total === snapshot.reservations.filter(record => record.status === 'reserved').length;
+}
+
 /** Validate a complete job; drafts can be stored without passing this gate. */
 export function validateJob(job, { now, requireSchedule = true } = {}) {
   const errors = [];
@@ -149,12 +174,15 @@ export function planReservations(state, now) {
     const ownJobs = jobs.filter(job => job.accountId === account.id);
     if (!ownJobs.some(job => job.status === 'queued')) continue;
     if (accounts.filter(other => other.id === account.id).length !== 1) { reason('duplicate_account', '账号标识重复，需人工检查。', account.id); continue; }
+    if (account.pixivUserId && accounts.filter(other => String(other.pixivUserId || '') === String(account.pixivUserId)).length !== 1) {
+      reason('duplicate_pixiv_account', '同一 Pixiv 账号存在重复资料，需合并后再预约。', account.id); continue;
+    }
     if (account.connected !== true) { reason('account_disconnected', '账号尚未连接。', account.id); continue; }
     if (account.paused) { reason('account_paused', '账号队列已暂停。', account.id); continue; }
     if (account.premium !== true) { reason('premium_required', '预约投稿需要已确认的 Pixiv Premium 账号。', account.id); continue; }
     const remote = account.remote;
     const syncedAt = instant(remote?.syncedAt);
-    if (remote?.syncOk !== true || !Number.isInteger(remote?.total) || remote.total < 0 || !Array.isArray(remote?.reservations)) {
+    if (!isCompleteRemoteSnapshot({ ...remote, ok: remote?.syncOk }, account)) {
       reason('sync_required', '需要成功同步远端预约后才能派发。', account.id); continue;
     }
     if (!Number.isFinite(syncedAt) || syncedAt > time || time - syncedAt > SNAPSHOT_MAX_AGE_MS) {
@@ -195,7 +223,9 @@ export function reconcileRemote(state, accountId, snapshot, now) {
   if (!account) return next;
   const records = Array.isArray(snapshot?.reservations) ? snapshot.reservations : [];
   const reservedCount = records.filter(record => record?.status === 'reserved').length;
-  const successful = snapshot?.ok === true && Array.isArray(snapshot.reservations) && Number.isInteger(snapshot.total) && snapshot.total >= reservedCount && records.every(record => record && typeof record === 'object');
+  const successful = snapshot?.ok === true && Array.isArray(snapshot.reservations) && Number.isSafeInteger(snapshot.total) && snapshot.total >= reservedCount
+    && records.every(record => record && typeof record === 'object' && !Array.isArray(record))
+    && (snapshot.pixivUserId === undefined || snapshot.pixivUserId === null || String(snapshot.pixivUserId) === String(account.pixivUserId || ''));
   // Never infer historical ownership from the local account's current binding.
   // Native Chrome snapshots report the identity they have just verified; older
   // external connectors without that identity remain usable but cannot teach
@@ -208,6 +238,18 @@ export function reconcileRemote(state, accountId, snapshot, now) {
     account.remote = { syncOk: true, syncedAt: new Date(time).toISOString(), total: snapshot.total, reservations: structuredClone(records), complete: snapshot.complete === true };
   }
   for (const job of list(next, 'jobs').filter(item => item.accountId === accountId)) {
+    // A check is explanatory metadata only. Only a separately verified remote
+    // publication record below can move a job into the published list.
+    if (verifiedPixivUserId && snapshot.complete === true && ['reserved', 'needs_review', 'uploading'].includes(job.status) && job.remoteId) {
+      const checks = list(snapshot, 'publicationChecks').filter(check => check?.jobId === job.id && check.remoteId === job.remoteId);
+      if (checks.length === 1) {
+        const check = checks[0], checkedAt = instant(check.checkedAt);
+        if (check.status === 'pending' && /^[a-z_]{1,64}$/.test(check.reason || '') && Number.isFinite(checkedAt)
+          && checkedAt <= time && (!Number.isFinite(instant(job.publicationCheck?.checkedAt)) || checkedAt >= instant(job.publicationCheck.checkedAt))) {
+          job.publicationCheck = { jobId: job.id, remoteId: job.remoteId, status: 'pending', reason: check.reason, checkedAt: new Date(checkedAt).toISOString() };
+        }
+      }
+    }
     const found = successful ? records.filter(record => matches(job, record)) : [];
     if (found.length > 1) {
       job.status = 'needs_review'; job.reviewReason = 'multiple_remote_matches'; job.updatedAt = new Date(time).toISOString(); continue;
@@ -243,9 +285,13 @@ export function reconcileRemote(state, accountId, snapshot, now) {
             if (/^\d{1,30}$/.test(String(record.artworkId || ''))) job.artworkId = String(record.artworkId);
           }
           delete job.lastError; delete job.error; delete job.uploadOutcome;
+          delete job.publicationCheck;
         }
         delete job.reviewReason;
-        if (record.status === 'published') job.publishedAt = record.publishedAt || new Date(time).toISOString();
+        if (record.status === 'published') {
+          job.publishedAt = record.publishedAt || new Date(time).toISOString();
+          if (verifiedPixivUserId && Number.isFinite(instant(record.publicationVerifiedAt)) && instant(record.publicationVerifiedAt) <= time) job.publicationVerifiedAt = new Date(instant(record.publicationVerifiedAt)).toISOString();
+        }
         if (record.status === 'failed') job.error = record.error || '远端已明确返回投稿失败，请检查后手动处理。';
       } else {
         job.status = 'needs_review'; job.reviewReason = 'unknown_remote_status'; job.updatedAt = new Date(time).toISOString();

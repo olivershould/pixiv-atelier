@@ -87,6 +87,8 @@ test('mock worker health must complete before ready; one persistent process hand
   assert.deepEqual(analyzed.provenance.sources, metadata.sources);
   assert.deepEqual(analyzed.analyzedFiles, [{ id: file.id, sha256: file.sha256 }]);
   assert.equal(f.processes[0].options.windowsHide, true);
+  assert.deepEqual(f.processes[0].args, ['-I', '-X', 'utf8', '-u', f.workerPath]);
+  assert.ok(Object.keys(f.processes[0].options.env).every(key => !/^PYTHON/i.test(key)));
   assert.equal(f.processes[0].options.env.TAGGER_UPLOAD_DIR, f.uploadDir);
 });
 
@@ -218,6 +220,51 @@ test('missing Python configuration is an unavailable capability, not an applicat
   const status = await f.tagger.status();
   assert.equal(status.ready, false); assert.equal(status.configured, false);
   assert.equal(status.code, 'TAGGER_NOT_CONFIGURED'); assert.equal(f.processes.length, 0);
+});
+
+test('saved relative interpreter, model and dependency paths resolve from the project, not the working directory', async t => {
+  const f = await fixture(t, undefined, { pythonPath: undefined, modelDir: undefined, runtimeDir: undefined });
+  const localPython = path.join(f.root, '.runtime', 'python', 'python.exe');
+  await fs.mkdir(path.dirname(localPython), { recursive: true });
+  await fs.writeFile(localPython, 'protocol mock only');
+  await fs.writeFile(path.join(f.dataDir, 'tagger-config.json'), JSON.stringify({
+    pythonPath: '.runtime/python/python.exe', runtimeDir: '.runtime/tagger', modelDir: '.data/models/wd-swinv2-v3',
+  }));
+  assert.notEqual(process.cwd(), f.root);
+  assert.equal((await f.tagger.status()).ready, true);
+  assert.equal(f.processes[0].command, localPython);
+  assert.equal(f.processes[0].options.env.TAGGER_RUNTIME, f.runtimeDir);
+  assert.equal(f.processes[0].options.env.TAGGER_MODEL_DIR, f.modelDir);
+  assert.equal(f.processes[0].options.cwd, f.root);
+  assert.equal((await f.tagger.analyze([await f.file('portable')])).candidates[0].tag, '女の子');
+});
+
+test('an unconfigured tagger discovers only its project-owned Python and explicit paths keep precedence', async t => {
+  const f = await fixture(t, undefined, { pythonPath: undefined });
+  assert.equal((await f.tagger.status()).code, 'TAGGER_NOT_CONFIGURED');
+  const localPython = path.join(f.root, '.runtime', 'python', 'python.exe');
+  await fs.mkdir(path.dirname(localPython), { recursive: true });
+  await fs.writeFile(localPython, 'protocol mock only');
+  assert.equal((await f.tagger.status()).ready, true);
+  assert.equal(f.processes[0].command, localPython);
+  await fs.writeFile(path.join(f.dataDir, 'tagger-config.json'), JSON.stringify({ pythonPath: process.execPath }));
+  assert.equal((await f.tagger.status()).ready, true);
+  assert.equal(f.processes[0].proc.killed, true);
+  assert.equal(f.processes[1].command, process.execPath);
+});
+
+test('explicit relative overrides replace saved paths and a missing configured interpreter is not silently substituted', async t => {
+  const f = await fixture(t, undefined, { pythonPath: '.runtime/python/python.exe', modelDir: '.data/models/wd-swinv2-v3', runtimeDir: '.runtime/tagger' });
+  await fs.writeFile(path.join(f.dataDir, 'tagger-config.json'), JSON.stringify({ pythonPath: process.execPath, modelDir: 'old-model', runtimeDir: 'old-runtime' }));
+  assert.equal((await f.tagger.status()).code, 'TAGGER_FILES_MISSING');
+  assert.equal(f.processes.length, 0);
+  const localPython = path.join(f.root, '.runtime', 'python', 'python.exe');
+  await fs.mkdir(path.dirname(localPython), { recursive: true });
+  await fs.writeFile(localPython, 'protocol mock only');
+  assert.equal((await f.tagger.status()).ready, true);
+  assert.equal(f.processes[0].command, localPython);
+  assert.equal(f.processes[0].options.env.TAGGER_RUNTIME, f.runtimeDir);
+  assert.equal(f.processes[0].options.env.TAGGER_MODEL_DIR, f.modelDir);
 });
 
 test('mock worker cannot claim health without model source-file SHA metadata', async t => {

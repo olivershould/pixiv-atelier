@@ -1,7 +1,22 @@
 export const QUEUE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+export const QUEUE_PARALLEL_LIMIT = 2;
 
 export function nextQueueCheck(now) {
   return new Date(Date.parse(now) + QUEUE_CHECK_INTERVAL_MS).toISOString();
+}
+
+// Read-only publication checks need an actual remote/upload history. A local
+// draft or an expired schedule alone is never evidence of a Pixiv submission.
+export function publicationReviewAccountIds(state, now) {
+  const time = Date.parse(now);
+  const ids = new Set();
+  for (const job of state.jobs || []) {
+    const hasRemote = Boolean(job.remoteId || job.reservedAt || job.remoteScheduledAt);
+    const hasUpload = job.uploadOutcome !== 'not_uploaded' && Boolean(job.uploadStartedAt || job.uploadOutcome === 'unknown');
+    if (!hasRemote && !hasUpload) continue;
+    if (job.status === 'needs_review' || (['reserved', 'uploading'].includes(job.status) && Date.parse(job.scheduledAt) <= time)) ids.add(job.accountId);
+  }
+  return [...ids];
 }
 
 export function summarizeQueueRun(before, after, run) {

@@ -101,9 +101,15 @@ export function createTagger(options = {}) {
     catch (reason) { if (reason.code !== 'ENOENT') throw error('TAGGER_CONFIG_INVALID', '本地识图配置文件格式无效。'); }
     if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw error('TAGGER_CONFIG_INVALID', '本地识图配置必须是对象。');
     const configuredPath = options.pythonPath ?? process.env.PIXIV_TAGGER_PYTHON ?? saved.pythonPath;
-    const pythonPath = nonempty(configuredPath) ? configuredPath.trim() : '';
-    const modelDir = path.resolve(options.modelDir || process.env.TAGGER_MODEL_DIR || saved.modelDir || path.join(dataDir, 'models', 'wd-swinv2-v3'));
-    const runtimeDir = path.resolve(options.runtimeDir || process.env.TAGGER_RUNTIME || saved.runtimeDir || path.join(projectRoot, '.runtime', 'tagger'));
+    let pythonPath = nonempty(configuredPath) ? path.resolve(projectRoot, configuredPath.trim()) : '';
+    if (configuredPath === undefined) {
+      // A project-owned runtime remains available without another app or PATH.
+      const bundledPython = path.join(projectRoot, '.runtime', 'python', 'python.exe');
+      try { if ((await fs.stat(bundledPython)).isFile()) pythonPath = bundledPython; }
+      catch (reason) { if (reason.code !== 'ENOENT') throw reason; }
+    }
+    const modelDir = path.resolve(projectRoot, options.modelDir || process.env.TAGGER_MODEL_DIR || saved.modelDir || path.join(dataDir, 'models', 'wd-swinv2-v3'));
+    const runtimeDir = path.resolve(projectRoot, options.runtimeDir || process.env.TAGGER_RUNTIME || saved.runtimeDir || path.join(projectRoot, '.runtime', 'tagger'));
     const uploadDir = path.resolve(options.uploadDir || path.join(dataDir, 'uploads'));
     const workerPath = path.resolve(options.workerPath || path.join(projectRoot, 'tagger', 'worker.py'));
     return { pythonPath, modelDir, runtimeDir, uploadDir, workerPath, signature: JSON.stringify([pythonPath, modelDir, runtimeDir, uploadDir, workerPath]) };
@@ -126,10 +132,10 @@ export function createTagger(options = {}) {
       if (!worker.isFile() || !model.isDirectory() || !runtime.isDirectory()) throw new Error('missing');
       if (path.isAbsolute(config.pythonPath) && !(await fs.stat(config.pythonPath)).isFile()) throw new Error('python');
     } catch { throw error('TAGGER_FILES_MISSING', '本地识图程序、模型目录或依赖环境尚未准备好。'); }
-    const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/(?:TOKEN|PASSWORD|SECRET|API_KEY)/i.test(key)));
-    const processHandle = (options.spawnProcess || spawn)(config.pythonPath, ['-u', config.workerPath], {
+    const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/(?:TOKEN|PASSWORD|SECRET|API_KEY)/i.test(key) && !/^PYTHON/i.test(key)));
+    const processHandle = (options.spawnProcess || spawn)(config.pythonPath, ['-I', '-X', 'utf8', '-u', config.workerPath], {
       cwd: projectRoot, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...environment, PYTHONUTF8: '1', PYTHONUNBUFFERED: '1', TAGGER_RUNTIME: config.runtimeDir, TAGGER_MODEL_DIR: config.modelDir, TAGGER_UPLOAD_DIR: config.uploadDir },
+      env: { ...environment, TAGGER_RUNTIME: config.runtimeDir, TAGGER_MODEL_DIR: config.modelDir, TAGGER_UPLOAD_DIR: config.uploadDir },
     });
     child = processHandle; workerSignature = config.signature; buffer = '';
     processHandle.stdout.setEncoding('utf8');

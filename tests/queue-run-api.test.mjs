@@ -20,17 +20,20 @@ const tagger = () => ({ status: async () => ({ configured: false, ready: false }
 function mockBrowser() {
   const state = { reads: [], submissions: [], records: [], beforeSnapshot: null, beforeReserve: null, avatarUrl: '', snapshotOverride: null };
   function snapshot(account) {
+    const records = state.records.filter(record => !record.accountId || record.accountId === account.id);
     return { ok: true, connected: true, premium: true, complete: true, pixivUserId: account.pixivUserId,
-      total: state.records.filter(record => record.status === 'reserved').length,
-      reservations: structuredClone(state.records), avatarUrl: state.avatarUrl, ...state.snapshotOverride };
+      total: records.filter(record => record.status === 'reserved').length,
+      reservations: structuredClone(records), avatarUrl: state.avatarUrl, ...state.snapshotOverride };
   }
   return { state, connector: {
     bind: async account => ({ account: { ...account, browser: { targetId: account.id, postingEnabled: false } }, snapshot: snapshot(account) }),
     snapshot: async (account, options) => { state.reads.push({ account: structuredClone(account), options: structuredClone(options) }); await state.beforeSnapshot?.(); return snapshot(account); },
     reserve: async (account, job, files, key, controls) => {
       state.submissions.push({ account: structuredClone(account), job: structuredClone(job), files, key });
-      await state.beforeReserve?.(controls);
-      const reservation = { remoteId: `illust:${50 + state.submissions.length}`, jobId: job.id, idempotencyKey: key,
+      const ordinal = state.submissions.length;
+      await state.beforeReserve?.(controls, job, account);
+      if (controls?.shouldStop?.()) return { definitive: true, outcome: 'not_uploaded', paused: true, error: '预约已停止，尚未提交。' };
+      const reservation = { remoteId: `illust:${50 + ordinal}`, accountId: account.id, jobId: job.id, idempotencyKey: key,
         scheduledAt: job.scheduledAt, status: 'reserved' };
       state.records.push(reservation);
       return { reservation };
@@ -318,6 +321,145 @@ function receivedRequestBody(server, pathname) {
   });
 }
 
+async function eventually(predicate) {
+  const end = Date.now() + 2500;
+  while (Date.now() < end) { if (predicate()) return; await sleep(5); }
+  assert.fail('Expected concurrent state was not reached.');
+}
+
+test('two same-account windows overlap with a durable slot claim, peak at two, and preserve out-of-order results', async t => {
+  const f = await fixture(t); const { draft } = await liveJob(f);
+  for (let i = 1; i < 5; i++) await f.request('/api/jobs', 'POST', { ...draft, title: '并行 ' + i, scheduledAt: `2026-10-05T${12 + i}:00:00Z` });
+  const gates = [deferred(), deferred()]; let active = 0, peak = 0, entered = 0;
+  f.browser.state.beforeReserve = async () => {
+    const ordinal = entered++; active++; peak = Math.max(peak, active);
+    try { if (ordinal < 2) await gates[ordinal].promise; else await sleep(5); }
+    finally { active--; }
+  };
+  const start = await f.request('/api/queue/start', 'POST', {});
+  try {
+    await eventually(() => entered === 2);
+    const persisted = JSON.parse(await fs.readFile(path.join(f.dataDir, 'state.json'), 'utf8'));
+    const claims = persisted.states.live.jobs.filter(job => job.status === 'uploading');
+    assert.equal(claims.length, 2); assert.ok(claims.every(job => job.idempotencyKey && job.uploadStartedAt));
+    const duplicate = await f.request('/api/queue/start', 'POST', {});
+    assert.equal(duplicate.data.queueRun.id, start.data.queueRun.id);
+    gates[1].resolve();
+    await eventually(() => entered === 5 && active === 1);
+    assert.equal(active, 1, 'The second worker can finish later jobs while the first remains in preparation.');
+  } finally { for (const gate of gates) gate.resolve(); }
+  const finished = await f.completed(start.data.queueRun.id);
+  assert.equal(peak, 2); assert.equal(finished.jobs.filter(job => job.status === 'reserved').length, 5);
+  assert.equal(new Set(finished.jobs.map(job => job.remoteId)).size, 5); assert.equal(finished.queueRun.reserved, 5);
+  const saved = JSON.parse(await fs.readFile(path.join(f.dataDir, 'state.json'), 'utf8'));
+  assert.deepEqual(saved.states.live.jobs.map(job => [job.id, job.status, job.remoteId]), finished.jobs.map(job => [job.id, job.status, job.remoteId]));
+  const again = await f.request('/api/queue/start', 'POST', {}); await f.completed(again.data.queueRun.id);
+  assert.equal(f.browser.state.submissions.length, 5);
+});
+
+test('different accounts run concurrently and each account keeps its own confirmed reservations', async t => {
+  const f = await fixture(t); const { draft, account } = await liveJob(f);
+  await f.request('/api/jobs', 'POST', { ...draft, title: '第一账号的另一件', scheduledAt: '2026-10-05T13:00:00Z' });
+  const added = await f.request('/api/accounts', 'POST', { name: '第二账号', pixivUserId: '654321' });
+  const second = added.data.accounts.find(item => item.id !== account.id);
+  await f.request(`/api/accounts/${second.id}/browser`, 'POST', { candidateId: 'second' });
+  await f.request('/api/jobs', 'POST', { ...draft, accountId: second.id, title: '另一个账号' });
+  const release = deferred(); let entered = 0;
+  f.browser.state.beforeReserve = async () => { entered++; await release.promise; };
+  const start = await f.request('/api/queue/start', 'POST', {});
+  try {
+    await eventually(() => entered === 2);
+    assert.equal(new Set(f.browser.state.submissions.map(call => call.account.id)).size, 2);
+  } finally { release.resolve(); }
+  const finished = await f.completed(start.data.queueRun.id);
+  assert.equal(finished.jobs.filter(job => job.status === 'reserved').length, 3);
+  assert.deepEqual(finished.accounts.map(item => item.remote.total), [2, 1]);
+  assert.ok(finished.accounts.every(item => item.browser.postingEnabled === false));
+});
+
+test('nine external reservations allow only one concurrent local claim and never exceed ten', async t => {
+  const f = await fixture(t); const { draft } = await liveJob(f);
+  await f.request('/api/jobs', 'POST', { ...draft, title: '等待一' });
+  await f.request('/api/jobs', 'POST', { ...draft, title: '等待二' });
+  f.browser.state.records = Array.from({ length: 9 }, (_, i) => ({ remoteId: 'external-' + i, status: 'reserved', scheduledAt: draft.scheduledAt }));
+  const release = deferred(); let entered = 0;
+  f.browser.state.beforeReserve = async () => { entered++; await release.promise; };
+  const start = await f.request('/api/queue/start', 'POST', {});
+  try { await eventually(() => entered === 1); await sleep(40); assert.equal(entered, 1); }
+  finally { release.resolve(); }
+  const finished = await f.completed(start.data.queueRun.id);
+  assert.equal(finished.accounts[0].remote.total, 10);
+  assert.equal(finished.jobs.filter(job => job.status === 'queued').length, 2);
+  assert.equal(f.browser.state.submissions.length, 1);
+});
+
+test('one uncertain result stops another prepared window on that account while a different account continues', async t => {
+  const f = await fixture(t); const { draft, account, job } = await liveJob(f);
+  const second = await f.request('/api/jobs', 'POST', { ...draft, title: '已准备未提交', scheduledAt: '2026-10-05T13:00:00Z' });
+  const third = await f.request('/api/jobs', 'POST', { ...draft, title: '仍在本地等待', scheduledAt: '2026-10-05T14:00:00Z' });
+  const added = await f.request('/api/accounts', 'POST', { name: '不受影响账号', pixivUserId: '654321' });
+  const other = added.data.accounts.find(item => item.id !== account.id);
+  await f.request(`/api/accounts/${other.id}/browser`, 'POST', { candidateId: 'other' });
+  await f.request('/api/jobs', 'POST', { ...draft, accountId: other.id, title: '其他账号继续' });
+  let entered = 0;
+  f.browser.state.beforeReserve = async (controls, candidate, owner) => {
+    if (owner.id !== account.id) return;
+    entered++;
+    if (candidate.id === job.id) { await eventually(() => entered === 2); throw new Error('点击后的结果未知'); }
+    await eventually(() => controls.shouldStop());
+  };
+  const start = await f.request('/api/queue/start', 'POST', {});
+  const finished = await f.completed(start.data.queueRun.id);
+  assert.equal(finished.jobs.find(item => item.id === job.id).status, 'needs_review');
+  const prepared = finished.jobs.find(item => item.id === second.data.createdJobId);
+  assert.equal(prepared.status, 'queued'); assert.equal(prepared.reservationAttempt, 2); assert.equal(prepared.idempotencyKey, undefined);
+  assert.equal(finished.jobs.find(item => item.id === third.data.createdJobId).status, 'queued');
+  assert.equal(finished.jobs.find(item => item.accountId === other.id).status, 'reserved');
+  assert.equal(f.browser.state.submissions.filter(call => call.account.id === account.id).length, 2);
+  assert.equal(f.browser.state.records.filter(row => row.accountId === account.id).length, 0);
+});
+
+test('global pause during both preparations stops both clicks and preserves every queued work', async t => {
+  const f = await fixture(t); const { draft } = await liveJob(f);
+  for (let i = 1; i < 3; i++) await f.request('/api/jobs', 'POST', { ...draft, title: '并行暂停 ' + i });
+  const release = deferred(); let entered = 0;
+  f.browser.state.beforeReserve = async () => { entered++; await release.promise; };
+  const start = await f.request('/api/queue/start', 'POST', {}); let pause;
+  try {
+    await eventually(() => entered === 2);
+    const received = receivedRequestBody(f.server, '/api/settings');
+    pause = f.request('/api/settings', 'PATCH', { queuePaused: true }); await received;
+  } finally { release.resolve(); }
+  await pause;
+  const finished = await f.completed(start.data.queueRun.id);
+  assert.equal(finished.settings.queuePaused, true); assert.equal(finished.jobs.filter(job => job.status === 'queued').length, 3);
+  assert.equal(f.browser.state.records.length, 0); assert.equal(f.browser.state.submissions.length, 2);
+});
+
+test('external occupation discovered before click returns work to waiting, refreshes capacity, and does not retry this pass', async t => {
+  const f = await fixture(t); const { job, draft } = await liveJob(f);
+  f.browser.connector.reserve = async (account, candidate, files, key) => {
+    f.browser.state.submissions.push({ account, job: candidate, files, key });
+    f.browser.state.records = Array.from({ length: 10 }, (_, i) => ({ remoteId: 'external-' + i, status: 'reserved', scheduledAt: draft.scheduledAt }));
+    return { definitive: true, outcome: 'not_uploaded', capacityBlocked: true, error: '名额已满' };
+  };
+  const start = await f.request('/api/queue/start', 'POST', {}); const finished = await f.completed(start.data.queueRun.id);
+  const waiting = finished.jobs.find(item => item.id === job.id);
+  assert.equal(waiting.status, 'queued'); assert.equal(waiting.reservationAttempt, 2); assert.equal(waiting.idempotencyKey, undefined);
+  assert.equal(finished.accounts[0].remote.total, 10); assert.equal(f.browser.state.submissions.length, 1);
+  assert.ok(finished.logs.some(row => /预约名额已满，保留待补位/.test(row.message)));
+});
+
+test('manual start rejects incomplete, inconsistent, duplicate, and explicitly wrong-account snapshots before claims', async t => {
+  for (const override of [{ complete: false }, { complete: undefined }, { total: 1 }, { pixivUserId: '999' },
+    { total: 2, reservations: [{ remoteId: 'same', status: 'reserved' }, { remoteId: 'same', status: 'reserved' }] }]) {
+    const f = await fixture(t); const { job } = await liveJob(f); f.browser.state.snapshotOverride = override;
+    const start = await f.request('/api/queue/start', 'POST', {}); const finished = await f.completed(start.data.queueRun.id);
+    assert.equal(finished.jobs.find(item => item.id === job.id).status, 'queued');
+    assert.equal(finished.accounts[0].remote.syncOk, false); assert.equal(f.browser.state.submissions.length, 0);
+  }
+});
+
 for (const pauseScope of ['queue', 'account']) {
   for (const phase of ['initial snapshot', 'first reservation confirmation']) {
     test(`${pauseScope} pause received during ${phase} prevents later pending submissions`, async t => {
@@ -325,6 +467,8 @@ for (const pauseScope of ['queue', 'account']) {
       const { account, draft, job } = await liveJob(f);
       const created = await f.request('/api/jobs', 'POST', { ...draft, title: '第二件待预约', scheduledAt: '2026-10-05T13:00:00.000Z' });
       const secondId = created.data.createdJobId;
+      const third = await f.request('/api/jobs', 'POST', { ...draft, title: '第三件待预约', scheduledAt: '2026-10-05T14:00:00.000Z' });
+      const thirdId = third.data.createdJobId;
       const entered = deferred(), release = deferred();
       const heldRead = phase === 'initial snapshot' ? 1 : 2;
       f.browser.state.beforeSnapshot = async () => {
@@ -347,8 +491,9 @@ for (const pauseScope of ['queue', 'account']) {
       } finally { release.resolve(); }
       assert.equal((await pendingPause).status, 200);
       const finished = await f.completed(start.data.queueRun.id);
-      assert.equal(f.browser.state.submissions.length, phase === 'initial snapshot' ? 0 : 1);
-      assert.equal(finished.jobs.find(item => item.id === secondId).status, 'queued');
+      assert.ok(phase === 'initial snapshot' ? f.browser.state.submissions.length === 0 : f.browser.state.submissions.length >= 1 && f.browser.state.submissions.length <= 2);
+      assert.equal(finished.jobs.find(item => item.id === thirdId).status, 'queued', 'A pause stops work that has not entered either parallel window.');
+      assert.ok(['queued', 'reserved'].includes(finished.jobs.find(item => item.id === secondId).status));
       assert.equal(finished.jobs.find(item => item.id === job.id).status, phase === 'initial snapshot' ? 'queued' : 'reserved');
       if (pauseScope === 'queue') assert.equal(finished.settings.queuePaused, true);
       else assert.equal(finished.accounts[0].paused, true);

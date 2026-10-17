@@ -1,80 +1,5 @@
-import { spawn } from 'node:child_process';
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
-
 export class BrowserError extends Error {
   constructor(message, code = 'browser_error') { super(message); this.status = 503; this.code = code; }
-}
-
-function commandError(value) {
-  const message = String(value?.message || value || '浏览器操作失败。');
-  if (/waiting for remote-debugging approval/i.test(message)) return new BrowserError('Chrome 正在等待授权。请在 Chrome 弹出的远程调试提示中点击「允许」，然后重新检测。', 'approval_required');
-  if (/tab_gone|pinned tab.*closed/i.test(message)) return new BrowserError('绑定的 Pixiv 标签页已关闭，请重新绑定。', 'tab_gone');
-  if (/no.*(?:chrome|browser).*running|could not.*connect|connection refused/i.test(message)) return new BrowserError('无法连接现有 Chrome。请保持 Chrome 打开并开启远程调试。', 'disconnected');
-  return new BrowserError(message.slice(0, 500), value?.code);
-}
-
-// Never invoke a shell: titles, captions and file names are data, not commands.
-export function createAgentBrowser({ executable, session = 'pixiv-publisher' } = {}) {
-  if (!/^[a-zA-Z0-9_-]{1,100}$/.test(session)) throw new Error('浏览器会话名称无效。');
-  let resolved;
-  async function locate() {
-    if (resolved) return resolved;
-    const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
-    const suffixes = process.platform === 'win32'
-      ? [`agent-browser-win32-${process.arch}.exe`, 'agent-browser.exe']
-      : [`agent-browser-${process.platform}-${process.arch}`, 'agent-browser'];
-    const pathDirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
-    const explicit = [executable, process.env.PIXIV_AGENT_BROWSER_PATH].filter(Boolean)
-      .flatMap(file => path.isAbsolute(file) || /[/\\]/.test(file) ? [file] : pathDirs.map(dir => path.join(dir, file)));
-    const candidates = [...explicit, ...suffixes.flatMap(suffix => [
-      path.join(home, 'tools/agent-browser/node_modules/agent-browser/bin', suffix),
-      path.join(os.homedir(), '.local/bin', suffix),
-      ...pathDirs.flatMap(dir => [path.join(dir, suffix), path.join(dir, 'node_modules/agent-browser/bin', suffix)]),
-    ])];
-    for (const file of candidates) { try { if (!(await fs.stat(file)).isFile()) continue; await fs.access(file); resolved = file; return file; } catch {} }
-    throw new BrowserError('未找到 agent-browser。请安装配套命令行工具，或设置 PIXIV_AGENT_BROWSER_PATH。', 'cli_missing');
-  }
-  async function command(args, input) {
-    const file = await locate();
-    return new Promise((resolve, reject) => {
-      const child = spawn(file, ['--auto-connect', '--pin-tab', '--session', session, '--json', ...args], {
-        shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env },
-      });
-      let output = '', settled = false;
-      const finish = (error, data) => { if (settled) return; settled = true; clearTimeout(timer); error ? reject(error) : resolve(data); };
-      const timer = setTimeout(() => { child.kill(); finish(new BrowserError('Chrome 响应超时。请检查浏览器的远程调试授权；结果不明时不会重复提交。', 'timeout')); }, 45000);
-      child.stdout.on('data', part => {
-        output += part.toString();
-        if (output.length > 8 * 1024 * 1024) { child.kill(); finish(new BrowserError('浏览器返回内容超出安全范围。')); }
-        // A newly spawned daemon can inherit stdout. Resolve on the JSON result
-        // instead of waiting forever for the inherited pipe to close.
-        for (const line of output.split(/\r?\n/).filter(Boolean)) {
-          try { const data = JSON.parse(line); if (typeof data.success === 'boolean') {
-            if (data.success) finish(null, data.data);
-            else finish(commandError(data.error));
-          }} catch {}
-        }
-      });
-      child.stderr.resume(); // Do not log page contents or browser credentials.
-      child.on('error', () => finish(new BrowserError('agent-browser 无法启动，请检查安装路径。', 'cli_missing')));
-      child.on('close', () => { if (!settled) {
-        try { const data = JSON.parse(output); if (data.success) return finish(null, data.data); } catch {}
-        finish(new BrowserError('未收到有效的浏览器结果。请保持 Chrome 开启并允许远程调试。'));
-      }});
-      child.stdin.on('error', () => {});
-      child.stdin.end(input);
-    });
-  }
-  return {
-    command,
-    evaluate: async (fn, arg) => (await command(['eval', '--stdin'], `(${fn.toString()})(${JSON.stringify(arg ?? null)})`)).result,
-    tabs: async () => (await command(['tab', 'list'])).tabs,
-    select: target => command(['tab', target]),
-    openTab: async url => { await command(['tab', 'new', url]); return (await command(['tab', 'list'])).tabs.find(tab => tab.active); },
-  };
 }
 
 // These functions run in the selected Pixiv page. Only non-secret fields leave
@@ -214,8 +139,12 @@ export async function readPublished({ artworkId, expectedId }) {
   const json = await response.json(), work = json.body;
   if (json.error || String(work?.userId) !== expectedId || String(work?.id) !== artworkId) throw new Error('作品不存在，或不属于绑定的 Pixiv 账号。');
   if (work.isReserved === true || work.isDraft === true || ['reserved', 'draft', 'scheduled'].includes(work.status)) throw new Error('作品尚未发布。');
+  const rawTags = work.tags?.tags;
+  const tags = Array.isArray(rawTags) && rawTags.length <= 10 && rawTags.every(row => typeof row?.tag === 'string'
+    && row.tag.length > 0 && row.tag.length <= 100 && !/[\u0000-\u001f\u007f]/.test(row.tag))
+    && new Set(rawTags.map(row => row.tag)).size === rawTags.length ? rawTags.map(row => row.tag).sort() : null;
   return { artworkId, title: work.title, pageCount: work.pageCount, userId: String(work.userId), createDate: work.createDate,
-    illustType: work.illustType };
+    illustType: work.illustType, tags, xRestrict: Number.isInteger(work.xRestrict) && [0, 1, 2].includes(work.xRestrict) ? work.xRestrict : null };
   } finally { clearTimeout(timer); }
 }
 

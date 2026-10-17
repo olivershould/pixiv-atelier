@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { createBackgroundBrowser } from '../server/background-browser.mjs';
 
-function fixture(t, handler, timeoutMs = 1000, { autoOpen = true, connectTimeoutMs } = {}) {
+function fixture(t, handler, timeoutMs = 1000, { autoOpen = true, connectTimeoutMs, dedicated = false } = {}) {
   const requests = [], sockets = [];
   let endpointCalls = 0;
   const targets = [
@@ -41,7 +41,7 @@ function fixture(t, handler, timeoutMs = 1000, { autoOpen = true, connectTimeout
     message(data) { queueMicrotask(() => { const event = new Event('message'); event.data = JSON.stringify(data); this.dispatchEvent(event); }); }
     close() { if (this.readyState === 3) return; this.readyState = 3; this.dispatchEvent(new Event('close')); }
   }
-  const browser = createBackgroundBrowser({ endpoint: async () => { endpointCalls++; return 'ws://127.0.0.1:9222/devtools/browser/test'; }, WebSocketImpl: FakeWebSocket, timeoutMs, connectTimeoutMs });
+  const browser = createBackgroundBrowser({ endpoint: async () => { endpointCalls++; return 'ws://127.0.0.1:9222/devtools/browser/test'; }, WebSocketImpl: FakeWebSocket, timeoutMs, connectTimeoutMs, dedicated });
   t.after(() => browser.close());
   return { browser, requests, sockets, targets, endpointCalls: () => endpointCalls };
 }
@@ -57,6 +57,120 @@ test('background browser routes selected targets without activating Chrome', asy
   assert.equal(f.endpointCalls(), 1);
   assert.equal(f.requests.filter(request => request.method === 'Target.attachToTarget').length, 2);
   assert.ok(f.requests.every(request => !['Page.bringToFront', 'Target.activateTarget', 'Browser.setWindowBounds'].includes(request.method)));
+});
+
+test('parallel forks keep account and posting cursors independent on one connection', async t => {
+  let created = 0;
+  const f = fixture(t, ({ request, reply, targets }) => {
+    if (request.method === 'Target.createTarget') {
+      const targetId = `WORK-${++created}`;
+      targets.push({ targetId, type: 'page', url: request.params.url, browserContextId: request.params.browserContextId });
+      reply({ targetId }); return true;
+    }
+    if (request.method === 'Runtime.evaluate' && request.params.returnByValue === false) {
+      reply({ result: { type: 'object', objectId: `input-${request.sessionId}` } }); return true;
+    }
+  });
+  await f.browser.select('A');
+  const first = f.browser.fork(), second = f.browser.fork(), otherAccount = f.browser.fork();
+  t.after(() => { first.close(); second.close(); otherAccount.close(); });
+  await otherAccount.select('B');
+  const workers = [first, second, otherAccount];
+  const tabs = await Promise.all(workers.map(worker => worker.openTab('https://www.pixiv.net/illustration/create')));
+  assert.equal(new Set(tabs.map(tab => tab.targetId)).size, 3);
+  assert.deepEqual(tabs.map(tab => f.targets.find(target => target.targetId === tab.targetId).browserContextId), ['profile-a', 'profile-a', 'profile-b']);
+  assert.equal(await f.browser.evaluate(() => 'root'), 'session-A');
+  assert.deepEqual(await Promise.all(workers.map(worker => worker.evaluate(() => 'worker'))), tabs.map(tab => `session-${tab.targetId}`));
+  await Promise.all(workers.map((worker, index) => worker.command(['upload', 'input[type="file"]', `D:\\images\\${index}.png`])));
+  const uploads = f.requests.filter(request => request.method === 'DOM.setFileInputFiles');
+  assert.equal(uploads.length, 3);
+  for (let index = 0; index < workers.length; index++) {
+    const upload = uploads.find(request => request.params.files[0] === `D:\\images\\${index}.png`);
+    assert.equal(upload.sessionId, `session-${tabs[index].targetId}`);
+    assert.equal(upload.params.objectId, `input-${upload.sessionId}`);
+  }
+  assert.deepEqual(await Promise.all(workers.map(worker => worker.command(['fill', 'input[name="title"]', 'title']))), tabs.map(tab => `session-${tab.targetId}`));
+  assert.equal(f.endpointCalls(), 1);
+  assert.equal(f.sockets.length, 1);
+  assert.ok(f.requests.filter(request => request.method === 'Target.createTarget').every(request => request.params.background === true && !request.params.newWindow));
+  assert.ok(f.requests.every(request => !/bringToFront|activateTarget|setWindowBounds/.test(request.method)));
+});
+
+test('forks share an in-flight attachment and initialize its session only once', async t => {
+  let attachReply;
+  const f = fixture(t, ({ request, reply }) => {
+    if (request.method === 'Target.attachToTarget') { attachReply = reply; return true; }
+  });
+  const first = f.browser.fork(), second = f.browser.fork();
+  const selecting = Promise.all([first.select('A'), second.select('A'), f.browser.select('A')]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.requests.filter(request => request.method === 'Target.attachToTarget').length, 1);
+  assert.equal(f.requests.filter(request => request.method === 'Runtime.enable').length, 0);
+  attachReply({ sessionId: 'shared-A' });
+  await selecting;
+  assert.deepEqual(await Promise.all([first.evaluate(() => 1), second.evaluate(() => 2), f.browser.evaluate(() => 3)]), ['shared-A', 'shared-A', 'shared-A']);
+  assert.equal(f.requests.filter(request => request.method === 'Runtime.enable').length, 1);
+  assert.equal(f.requests.filter(request => request.method === 'Page.enable').length, 1);
+  assert.equal(f.endpointCalls(), 1);
+});
+
+test('failed shared attachment rejects all waiters and is not retained for explicit retry', async t => {
+  let failed = false;
+  const f = fixture(t, ({ request, socket }) => {
+    if (request.method === 'Target.attachToTarget' && !failed) {
+      failed = true;
+      socket.message({ id: request.id, error: { message: 'Cannot attach to target' } }); return true;
+    }
+  });
+  const first = f.browser.fork(), second = f.browser.fork();
+  const results = await Promise.allSettled([first.select('A'), second.select('A')]);
+  assert.deepEqual(results.map(result => result.status), ['rejected', 'rejected']);
+  assert.equal(f.requests.filter(request => request.method === 'Target.attachToTarget').length, 1);
+  assert.equal(f.requests.filter(request => request.method === 'Runtime.evaluate').length, 0);
+  await first.select('A');
+  assert.equal(await first.evaluate(() => 1), 'session-A');
+  assert.equal(f.requests.filter(request => request.method === 'Target.attachToTarget').length, 2);
+});
+
+test('fork release preserves other workers and root close invalidates every fork', async t => {
+  const f = fixture(t);
+  await f.browser.select('A');
+  const first = f.browser.fork(), second = f.browser.fork();
+  await second.select('B');
+  first.close();
+  await assert.rejects(first.evaluate(() => 'closed worker'), { code: 'disconnected' });
+  assert.equal(f.sockets[0].readyState, 1);
+  assert.equal(await second.evaluate(() => 'live worker'), 'session-B');
+  assert.equal(await f.browser.evaluate(() => 'owner'), 'session-A');
+  assert.equal(f.requests.filter(request => request.method === 'Target.closeTarget').length, 0);
+  f.browser.close();
+  assert.equal(f.sockets[0].readyState, 3);
+  await assert.rejects(second.evaluate(() => 'old worker'), { code: 'disconnected' });
+  assert.equal(f.endpointCalls(), 1);
+  await f.browser.select('A');
+  assert.equal(await f.browser.fork().evaluate(() => 'new worker'), 'session-A');
+  assert.equal(f.endpointCalls(), 2);
+});
+
+test('closing a worker tab leaves the other worker and root selections intact', async t => {
+  const f = fixture(t, ({ request, reply, targets }) => {
+    if (request.method !== 'Target.closeTarget') return;
+    const index = targets.findIndex(target => target.targetId === request.params.targetId);
+    if (index !== -1) targets.splice(index, 1);
+    reply({ success: true }); return true;
+  });
+  await f.browser.select('A');
+  const closing = f.browser.fork(), continuing = f.browser.fork();
+  await closing.select('B');
+  const [closed, value] = await Promise.all([
+    closing.command(['tab', 'close']), continuing.evaluate(() => 'continue'),
+  ]);
+  assert.deepEqual(closed, { closed: true, targetId: 'B' });
+  assert.equal(value, 'session-A');
+  assert.equal(await f.browser.evaluate(() => 'root'), 'session-A');
+  await assert.rejects(closing.evaluate(() => 'no fallback'), { code: 'unbound' });
+  assert.deepEqual(f.requests.filter(request => request.method === 'Target.closeTarget').map(request => request.params.targetId), ['B']);
+  assert.equal(f.sockets[0].readyState, 1);
 });
 
 test('caller timeout preserves the pending Chrome handshake for retries and concurrent callers', async t => {
@@ -255,6 +369,75 @@ test('missing source profile fails closed instead of using the default Chrome pr
   await f.browser.select('B');
   await assert.rejects(f.browser.openTab('https://www.pixiv.net/illustration/create'), { code: 'identity_mismatch' });
   assert.equal(f.requests.filter(request => request.method === 'Target.createTarget').length, 0);
+});
+
+test('only managed dedicated Chrome can bootstrap a background default-context page', async t => {
+  const f = fixture(t, null, 1000, { dedicated: true });
+  f.targets.length = 0;
+  const tab = await f.browser.openTab('https://www.pixiv.net/dashboard/works');
+  assert.equal(tab.targetId, 'NEW');
+  const create = f.requests.find(request => request.method === 'Target.createTarget');
+  assert.equal(create.params.background, true);
+  assert.equal(Object.hasOwn(create.params, 'browserContextId'), false);
+  assert.equal(await f.browser.evaluate(() => 1), 'session-NEW');
+  assert.ok(f.requests.every(request => !/bringToFront|activateTarget|setWindowBounds/.test(request.method)));
+  const legacy = fixture(t);
+  await assert.rejects(legacy.browser.openTab('https://www.pixiv.net/'), { code: 'unbound' });
+  assert.equal(legacy.requests.filter(request => request.method === 'Target.createTarget').length, 0);
+  const released = f.browser.fork(); released.close();
+  await assert.rejects(released.openTab('https://www.pixiv.net/'), { code: 'disconnected' });
+});
+
+test('managed default context remains pinned when creating a form and rejects another context', async t => {
+  const f = fixture(t, null, 1000, { dedicated: true });
+  delete f.targets[0].browserContextId;
+  await f.browser.select('A');
+  await f.browser.openTab('https://www.pixiv.net/illustration/create');
+  assert.equal(Object.hasOwn(f.requests.find(request => request.method === 'Target.createTarget').params, 'browserContextId'), false);
+  const wrong = fixture(t, ({ request, reply, targets }) => {
+    if (request.method !== 'Target.createTarget') return;
+    targets.push({ targetId: 'WRONG', type: 'page', url: request.params.url, browserContextId: 'unexpected' });
+    reply({ targetId: 'WRONG' }); return true;
+  }, 1000, { dedicated: true });
+  await assert.rejects(wrong.browser.openTab('https://www.pixiv.net/dashboard/works'), { code: 'identity_mismatch' });
+  assert.equal(wrong.requests.filter(request => request.method === 'Page.navigate').length, 0);
+  assert.deepEqual(wrong.requests.filter(request => request.method === 'Target.closeTarget').map(request => request.params.targetId), ['WRONG']);
+});
+
+test('managed bootstrap anchors to the existing blank startup page and its nonempty default context', async t => {
+  const f = fixture(t, null, 1000, { dedicated: true });
+  f.targets.push({ targetId: 'STARTUP', type: 'page', url: 'about:blank', browserContextId: 'managed-default' });
+  const tab = await f.browser.openTab('data:text/html,<title>Dedicated Chrome test</title>');
+  assert.equal(tab.targetId, 'NEW');
+  assert.equal(f.requests.find(request => request.method === 'Target.createTarget').params.browserContextId, 'managed-default');
+  assert.equal(f.targets.find(target => target.targetId === 'STARTUP').url, 'about:blank');
+  assert.equal(f.requests.filter(request => request.method === 'Page.navigate').length, 1);
+  assert.ok(f.requests.every(request => !/bringToFront|activateTarget|setWindowBounds/.test(request.method)));
+});
+
+test('managed bootstrap with no pages adopts the new default context, then rejects any navigation context change', async t => {
+  function defaultContext({ request, reply, targets }) {
+    if (request.method !== 'Target.createTarget') return;
+    targets.push({ targetId: 'NEW', type: 'page', url: request.params.url, browserContextId: 'managed-default' });
+    reply({ targetId: 'NEW' }); return true;
+  }
+  const f = fixture(t, defaultContext, 1000, { dedicated: true });
+  f.targets.length = 0;
+  const tab = await f.browser.openTab('data:text/html,<title>Dedicated Chrome test</title>');
+  assert.equal(tab.targetId, 'NEW');
+  assert.equal(Object.hasOwn(f.requests.find(request => request.method === 'Target.createTarget').params, 'browserContextId'), false);
+  assert.equal(f.requests.filter(request => request.method === 'Target.createTarget').length, 1);
+  assert.equal(f.requests.filter(request => request.method === 'Page.navigate').length, 1);
+  assert.equal(f.requests.filter(request => request.method === 'Target.closeTarget').length, 0);
+  const changed = fixture(t, args => {
+    if (defaultContext(args)) return true;
+    if (args.request.method !== 'Page.navigate') return;
+    Object.assign(args.targets[0], { url: args.request.params.url, browserContextId: 'another-context' });
+    args.reply({ frameId: 'frame-new' }); return true;
+  }, 1000, { dedicated: true });
+  changed.targets.length = 0;
+  await assert.rejects(changed.browser.openTab('https://www.pixiv.net/dashboard/works'), { code: 'identity_mismatch' });
+  assert.equal(changed.requests.filter(request => request.method === 'Target.createTarget').length, 1);
 });
 
 test('unknown target creation errors never trigger another creation path', async t => {

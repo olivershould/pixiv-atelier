@@ -1,11 +1,13 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { BrowserError, readIdentity, readRemote, readForm, chooseSchedule, readPublished, clickSubmit, readTags, readPublishedHistory } from './browser-driver.mjs';
 import { createBackgroundBrowser } from './background-browser.mjs';
 import { chromeEndpoint } from './chrome-endpoint.mjs';
 import { validateJob } from './queue.mjs';
 import { readAccountAvatar } from './account-avatar.mjs';
+import { readArtworkAnalytics, readAnalyticsOverview, readAnalyticsWorksPage } from './browser-analytics.mjs';
 
 const clone = value => structuredClone(value);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -58,19 +60,87 @@ export function unsupportedFields(job) {
   return issues;
 }
 
-export async function createBrowserConnector({ dataDir, driver, now = () => new Date(), session, executable, historyBatchDelayMs = 5000 } = {}) {
+// A fresh response distinguishes a logged-out dedicated profile from a profile
+// logged in as somebody else. No credentials or serialized state leave Chrome.
+async function readDedicatedIdentity() {
+  if (location.origin !== 'https://www.pixiv.net') return { loggedIn: false, pixivUserId: '' };
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch('/dashboard/works', { credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: controller.signal });
+    if (!response.ok) throw new Error('无法核对专用浏览器的 Pixiv 登录状态。');
+    const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+    const props = JSON.parse(doc.getElementById('__NEXT_DATA__')?.textContent || '{}').props?.pageProps;
+    if (!props) throw new Error('Pixiv 登录页面格式发生变化。');
+    const state = JSON.parse(props.serverSerializedPreloadedState || '{}');
+    return { loggedIn: props.isLoggedIn === true, pixivUserId: String(state.userData?.self?.id || props.gaUserData?.userId || '') };
+  } finally { clearTimeout(timer); }
+}
+
+export async function createBrowserConnector({ dataDir, driver, dedicatedChrome, dedicatedDriverFactory = createBackgroundBrowser,
+  now = () => new Date(), historyBatchDelayMs = 5000 } = {}) {
   let config = {};
   try { config = JSON.parse(await fs.readFile(path.join(dataDir, 'browser-config.json'), 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  const browser = driver || createBackgroundBrowser({ endpoint: () => chromeEndpoint({ userDataDir: config.userDataDir }) });
+  const sharedBrowser = driver || createBackgroundBrowser({ endpoint: () => chromeEndpoint({ userDataDir: config.userDataDir }) });
+  const dedicatedBrowsers = new Map();
+  const isDedicated = account => account?.browser?.mode === 'dedicated';
+  const dedicatedKey = account => `${account.id}:${account.pixivUserId}`;
+  function dedicatedSession(value) {
+    let url;
+    try { url = new URL(value?.endpoint); } catch {}
+    if (!url || !['ws:', 'wss:'].includes(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
+      || url.username || url.password || !['headless', 'interactive'].includes(value.mode)) reject('专用 Chrome 返回的连接信息无效。', 'dedicated_unavailable');
+    return value;
+  }
+  async function dedicatedEntry(account) {
+    if (!account?.id || !/^\d+$/.test(account.pixivUserId || '')) reject('请先设置此账号的 Pixiv ID。', 'unbound');
+    if (!dedicatedChrome?.ensure) reject('尚未配置专用 Chrome 管理器。', 'dedicated_unavailable');
+    const key = dedicatedKey(account);
+    let entry = dedicatedBrowsers.get(key);
+    if (!entry) {
+      entry = { account: clone(account), driver: null, targetId: null, runtimeMode: null, targetChain: Promise.resolve() };
+      dedicatedBrowsers.set(key, entry);
+      entry.ready = (async () => {
+        let initial = dedicatedSession(await dedicatedChrome.ensure(entry.account));
+        entry.runtimeMode = initial.mode;
+        entry.driver = dedicatedDriverFactory({ account: clone(entry.account), dedicated: true, endpoint: async () => {
+          const connected = initial || dedicatedSession(await dedicatedChrome.ensure(entry.account));
+          initial = null; entry.runtimeMode = connected.mode; entry.targetId = null;
+          return connected.endpoint;
+        } });
+        return entry;
+      })().catch(error => { if (dedicatedBrowsers.get(key) === entry) dedicatedBrowsers.delete(key); throw error; });
+    }
+    return entry.ready;
+  }
+  async function releaseDedicated(account) {
+    const key = dedicatedKey(account), entry = dedicatedBrowsers.get(key);
+    if (!entry) return;
+    dedicatedBrowsers.delete(key);
+    await entry.ready.then(value => value.driver.close?.()).catch(() => {});
+  }
+  const browserScope = new AsyncLocalStorage();
+  // A reservation owns its cursor for its entire async lifetime. The transport
+  // and Chrome consent are shared; another job cannot redirect its commands.
+  const browser = Object.fromEntries(['tabs', 'select', 'evaluate', 'openTab', 'command'].map(method =>
+    [method, (...args) => (browserScope.getStore() || sharedBrowser)[method](...args)]));
+  async function inAccount(account, task, { reservation = false } = {}) {
+    const selectedDriver = isDedicated(account) ? (await dedicatedEntry(account)).driver : sharedBrowser;
+    const scoped = typeof selectedDriver.fork === 'function' ? selectedDriver.fork() : selectedDriver;
+    const run = () => browserScope.run(scoped, task);
+    try { return await (reservation && scoped === selectedDriver ? atomic(run) : run()); }
+    finally { if (scoped !== selectedDriver) scoped.close?.(); }
+  }
   const ledgerPath = path.join(dataDir, 'browser-ledger.json');
   let ledger = {};
   try { ledger = JSON.parse(await fs.readFile(ledgerPath, 'utf8')); if (!ledger || Array.isArray(ledger) || typeof ledger !== 'object') throw new Error('投稿记录损坏；停止连接以防重复投稿。'); }
   catch (e) { if (e.code !== 'ENOENT') throw e; }
-  let chain = Promise.resolve(), candidates = new Map();
+  let chain = Promise.resolve(), ledgerWrites = Promise.resolve(), candidates = new Map();
+  const submissions = new Map();
   // This internal constructor option is for isolated tests only. No HTTP
   // request or account setting can bypass the shared history pacing.
   const historyInterval = Number.isFinite(historyBatchDelayMs) ? Math.max(0, Math.min(60000, historyBatchDelayMs)) : 5000;
   let historyFinishedAt = 0, historyResumeAfter = 0;
+  let analyticsResumeAfter = 0;
   async function historySlot(deadline) {
     const wait = Math.max(0, historyFinishedAt + historyInterval - Date.now(), historyResumeAfter - Date.now());
     if (Date.now() + wait >= deadline) return false;
@@ -94,24 +164,97 @@ export async function createBrowserConnector({ dataDir, driver, now = () => new 
     return `${phase}时${reason}${error.retryAfterSeconds ? `，服务端要求至少等待 ${error.retryAfterSeconds} 秒` : ''}。`;
   }
   const atomic = task => { const result = chain.then(task); chain = result.catch(() => {}); return result; };
-  async function save() { const temp = `${ledgerPath}.${randomUUID()}.tmp`; await fs.writeFile(temp, JSON.stringify(ledger, null, 2), { mode: 0o600 }); await fs.rename(temp, ledgerPath); }
+  function save() {
+    const contents = JSON.stringify(ledger, null, 2);
+    const saved = ledgerWrites.then(async () => {
+      const temp = `${ledgerPath}.${randomUUID()}.tmp`;
+      try { await fs.writeFile(temp, contents, { mode: 0o600 }); await fs.rename(temp, ledgerPath); }
+      catch (error) { await fs.unlink(temp).catch(() => {}); throw error; }
+    });
+    ledgerWrites = saved.catch(() => {});
+    return saved;
+  }
+  function submitForAccount(account, task) {
+    // Two local bindings for one Pixiv identity must share the commit lock.
+    const identity = String(account.pixivUserId), previous = submissions.get(identity) || Promise.resolve();
+    const result = previous.then(task), settled = result.catch(() => {});
+    submissions.set(identity, settled);
+    void settled.then(() => { if (submissions.get(identity) === settled) submissions.delete(identity); });
+    return result;
+  }
+  async function closeConfirmedForm(key, account) {
+    const item = ledger[key];
+    if (item.phase !== 'confirmed' || !item.ownedTargetId || item.ownedTargetId === account.browser?.targetId) return;
+    try {
+      if ((await browser.tabs()).some(tab => tab.targetId === item.ownedTargetId)) {
+        await browser.command(['tab', 'close', item.ownedTargetId]);
+      }
+      item.formClosedAt = new Date(now()).toISOString();
+    } catch (error) { item.formCloseError = String(error.message || '投稿页未能自动关闭。').slice(0, 500); }
+    // Failure to close a page cannot undo a confirmed reservation or make it
+    // eligible for resubmission. The confirmed record was saved beforehand.
+    await save().catch(() => {});
+  }
   async function select(targetId) {
     const tab = (await browser.tabs()).find(t => t.targetId === targetId && pixiv(t));
     if (!tab) reject('绑定的 Pixiv 标签页已关闭。请在账号管理中重新连接 Chrome。', 'tab_gone');
     await browser.select(targetId); return tab;
   }
+  async function selectAccount(account) {
+    if (!isDedicated(account)) return select(account.browser?.targetId);
+    const entry = await dedicatedEntry(account);
+    const selected = entry.targetChain.then(async () => {
+      const tabs = await browser.tabs();
+      const forms = new Set(Object.values(ledger).filter(item => item.pixivUserId === account.pixivUserId).map(item => item.ownedTargetId).filter(Boolean));
+      const candidates = tabs.filter(tab => pixiv(tab) && !forms.has(tab.targetId)
+        && !/^\/(?:illustration|manga)\/create\/?$/.test(new URL(tab.url).pathname));
+      let tab = candidates.find(item => item.targetId === entry.targetId)
+        || candidates.find(item => item.targetId === account.browser?.targetId) || candidates[0];
+      if (!tab) tab = await browser.openTab('https://www.pixiv.net/dashboard/works');
+      if (!pixiv(tab)) reject('请在此账号的专用 Chrome 窗口中登录 Pixiv，再验证连接。', 'login_required');
+      // Target IDs change after a managed Chrome restart. Only this account's
+      // dedicated endpoint is searched; never fall back to the user's Chrome.
+      entry.targetId = tab.targetId;
+      await browser.select(tab.targetId);
+      return tab;
+    });
+    entry.targetChain = selected.catch(() => {});
+    return selected;
+  }
   async function verify(account, targetId = account.browser?.targetId, options = {}) {
-    if (!targetId || !/^\d+$/.test(account.pixivUserId)) reject('此账号尚未绑定 Chrome 标签页。', 'unbound');
-    await select(targetId);
+    if ((!targetId && !isDedicated(account)) || !/^\d+$/.test(account.pixivUserId)) reject('此账号尚未绑定 Chrome 标签页。', 'unbound');
+    if (isDedicated(account) && (!targetId || targetId === account.browser?.targetId)) await selectAccount(account);
+    else await select(targetId);
     const data = await browser.evaluate(readRemote, { expectedId: account.pixivUserId, ...options });
     if (data?.identity?.pixivUserId !== account.pixivUserId) reject('当前 Pixiv 账号与绑定 ID 不符，已停止操作。', 'identity_mismatch');
     return data;
   }
+  async function verifyDedicatedAccount(account) {
+    await selectAccount(account);
+    await browser.command(['wait', '--fn', "document.readyState === 'complete'"]);
+    const identity = await browser.evaluate(readDedicatedIdentity);
+    if (!identity?.loggedIn) reject('此账号的专用 Chrome 尚未登录 Pixiv，请完成登录后再验证。', 'login_required');
+    if (identity.pixivUserId !== account.pixivUserId) reject('专用 Chrome 登录的 Pixiv ID 与原账号不符；请切换到原账号后再验证。', 'identity_mismatch');
+    const result = await snapshot(account, { jobs: [] }), entry = await dedicatedEntry(account);
+    return { account: { ...account, browser: { ...account.browser, mode: 'dedicated', runtimeMode: entry.runtimeMode,
+      targetId: entry.targetId, postingEnabled: false, loginPending: false, verifiedAt: new Date(now()).toISOString() } }, snapshot: result };
+  }
   function publicationExpected(job, pageCount = job?.files?.length) {
     if (typeof job?.title !== 'string' || !Number.isInteger(pageCount) || pageCount < 1 || pageCount > 200
       || !['illust', 'manga'].includes(job.content?.type) || !remoteDate(job.scheduledAt)) return null;
-    return { title: job.title, pageCount, illustType: job.content.type === 'manga' ? 1 : 0, scheduledAt: remoteDate(job.scheduledAt) };
+    const value = { title: job.title, pageCount, illustType: job.content.type === 'manga' ? 1 : 0, scheduledAt: remoteDate(job.scheduledAt) };
+    const tags = Array.isArray(job.tags) ? [...new Set([...job.tags, ...(job.content.contestTag ? [job.content.contestTag] : [])])] : null;
+    const xRestrict = { all: 0, r18: 1, r18g: 2 }[job.content.rating];
+    if (job.tagsConfirmed === true && validPublicationEvidence({ tags, xRestrict })) Object.assign(value, { tags: tags.sort(), xRestrict });
+    return value;
   }
+  function validPublicationEvidence(value) {
+    return Array.isArray(value?.tags) && value.tags.length <= 10
+      && value.tags.every(tag => typeof tag === 'string' && tag.length > 0 && tag.length <= 100 && !/[\u0000-\u001f\u007f]/.test(tag))
+      && new Set(value.tags).size === value.tags.length && Number.isInteger(value.xRestrict) && [0, 1, 2].includes(value.xRestrict);
+  }
+  const samePublicationEvidence = (left, right) => validPublicationEvidence(left) && validPublicationEvidence(right)
+    && left.xRestrict === right.xRestrict && JSON.stringify([...left.tags].sort()) === JSON.stringify([...right.tags].sort());
   function validExpected(item) {
     const value = item.publicationExpected;
     return value && typeof value.title === 'string' && Number.isInteger(value.pageCount) && value.pageCount > 0
@@ -138,12 +281,26 @@ export async function createBrowserConnector({ dataDir, driver, now = () => new 
       const remote = result.reservations.find(row => row.remoteId === item.remoteId);
       // The submitted ledger and exact local reservation identity must agree;
       // an unrelated draft or an edited title cannot supply missing evidence.
-      if (!validExpected(item)) {
-        const job = jobs.find(job => job.accountId === account.id && job.id === item.jobId && job.idempotencyKey === item.idempotencyKey
-          && job.remoteId === item.remoteId && ['reserved', 'needs_review'].includes(job.status));
-        const expected = publicationExpected(job);
-        if (expected && typeof item.title === 'string' && expected.title === item.title && expected.scheduledAt === remoteDate(item.scheduledAt)) {
-          item.publicationExpected = expected; changed = true;
+      const storedExpected = validExpected(item);
+      const hasEvidenceFields = item.publicationExpected && (Object.hasOwn(item.publicationExpected, 'tags') || Object.hasOwn(item.publicationExpected, 'xRestrict'));
+      if (!hasEvidenceFields) {
+        const boundJobs = jobs.filter(job => job.accountId === account.id && job.id === item.jobId && job.idempotencyKey === item.idempotencyKey
+          && job.remoteId === item.remoteId && ['reserved', 'needs_review'].includes(job.status)
+          && (!job.pixivUserId || String(job.pixivUserId) === account.pixivUserId));
+        const expected = boundJobs.length === 1 ? publicationExpected(boundJobs[0]) : null;
+        if (expected && typeof item.title === 'string' && expected.title === item.title && expected.scheduledAt === remoteDate(item.scheduledAt)
+          && (!storedExpected || storedExpected.title === expected.title && storedExpected.pageCount === expected.pageCount && storedExpected.illustType === expected.illustType)) {
+          if (!storedExpected) {
+            // Keep the legacy metadata upgrade, but no new distinguishing
+            // evidence without stored page/type metadata to compare against.
+            const { tags, xRestrict, ...base } = expected;
+            item.publicationExpected = base; changed = true;
+          } else if (validPublicationEvidence(expected)) {
+            // Remote-flow jobs are immutable through the API. This exact
+            // identity link can backfill older records, never replace evidence
+            // frozen before a submit or repair/create a missing baseline.
+            Object.assign(item.publicationExpected, { tags: expected.tags, xRestrict: expected.xRestrict }); changed = true;
+          }
         }
       }
       const expected = validExpected(item);
@@ -157,7 +314,7 @@ export async function createBrowserConnector({ dataDir, driver, now = () => new 
         continue;
       }
       if (!(Date.parse(item.scheduledAt) <= Date.parse(at))) continue;
-      const report = { jobId: item.jobId, remoteId: item.remoteId, status: 'pending' };
+      const report = { jobId: item.jobId, remoteId: item.remoteId, status: 'pending', checkedAt: at };
       checks.push(report);
       if (!expected) { report.reason = 'metadata_missing'; continue; }
       if (!hasBaseline(item)) { report.reason = 'baseline_missing'; continue; }
@@ -185,32 +342,49 @@ export async function createBrowserConnector({ dataDir, driver, now = () => new 
       } catch { details.set(id, null); break; }
     }
     const claimed = new Set(Object.values(ledger).filter(item => item.pixivUserId === account.pixivUserId).map(item => item.publishedId).filter(Boolean));
+    const competing = (entry, work) => Object.values(ledger).filter(other => other !== entry.item && other.pixivUserId === account.pixivUserId
+      && ['confirmed', 'unknown', 'submitting'].includes(other.phase) && !other.publishedId
+      && !result.reservations.some(row => row.remoteId === other.remoteId)
+      && typeof other.title === 'string' && titleMatches(work.title, other.title)
+      && Date.parse(remoteDate(work.createDate)) >= Date.parse(other.scheduledAt)
+      && Date.parse(remoteDate(work.createDate)) < Date.parse(other.scheduledAt) + 60000
+      && (!validExpected(other) || work.pageCount === other.publicationExpected.pageCount && work.illustType === other.publicationExpected.illustType));
     const matches = new Map();
     for (const entry of eligible) {
       if (entry.ids.some(id => !details.get(id))) { entry.report.reason = 'candidate_read_failed'; continue; }
-      const match = entry.ids.map(id => details.get(id)).filter(work => !claimed.has(work.artworkId)
+      let match = entry.ids.map(id => details.get(id)).filter(work => !claimed.has(work.artworkId)
         && titleMatches(work.title, entry.expected.title) && work.pageCount === entry.expected.pageCount && work.illustType === entry.expected.illustType
         // createDate is the verified Pixiv publication timestamp. Only the
         // scheduled minute qualifies; checks may occur many hours later.
         && Date.parse(remoteDate(work.createDate)) >= Date.parse(entry.expected.scheduledAt)
         && Date.parse(remoteDate(work.createDate)) < Date.parse(entry.expected.scheduledAt) + 60000
         && Date.parse(remoteDate(work.createDate)) <= Date.parse(at));
+      const hasFrozenEvidence = Object.hasOwn(entry.expected, 'tags') || Object.hasOwn(entry.expected, 'xRestrict');
+      // Once frozen, distinguishing evidence remains mandatory on every sync.
+      // A sibling confirmed on an earlier sync must not let the leftover work
+      // bypass a previously observed mismatch or incomplete evidence.
+      if (hasFrozenEvidence || match.length > 1 || match.some(work => competing(entry, work).length)) {
+        if (!validPublicationEvidence(entry.expected) || match.some(work => !validPublicationEvidence(work))) {
+          entry.report.reason = 'publication_evidence_missing'; continue;
+        }
+        match = match.filter(work => samePublicationEvidence(entry.expected, work));
+        if (!match.length) { entry.report.reason = 'publication_evidence_mismatch'; continue; }
+      }
       if (match.length !== 1) { entry.report.reason = match.length ? 'ambiguous_match' : 'no_unique_match'; continue; }
       matches.set(entry, match[0]);
     }
     const counts = new Map();
     for (const work of matches.values()) counts.set(work.artworkId, (counts.get(work.artworkId) || 0) + 1);
     for (const [entry, work] of matches) {
-      const possibleOtherOwner = Object.values(ledger).some(other => other !== entry.item && other.pixivUserId === account.pixivUserId
-        && ['confirmed', 'unknown', 'submitting'].includes(other.phase) && !other.publishedId
-        && !result.reservations.some(row => row.remoteId === other.remoteId)
-        && typeof other.title === 'string' && titleMatches(work.title, other.title)
-        && Date.parse(remoteDate(work.createDate)) >= Date.parse(other.scheduledAt)
-        && Date.parse(remoteDate(work.createDate)) < Date.parse(other.scheduledAt) + 60000
-        && (!validExpected(other) || work.pageCount === other.publicationExpected.pageCount && work.illustType === other.publicationExpected.illustType));
+      const possibleOtherOwner = competing(entry, work).some(other => !validExpected(other) || !validPublicationEvidence(other.publicationExpected)
+        || !validPublicationEvidence(work) || samePublicationEvidence(other.publicationExpected, work));
       if (counts.get(work.artworkId) !== 1 || possibleOtherOwner) { entry.report.reason = 'ambiguous_match'; continue; }
       Object.assign(entry.item, { publishedId: work.artworkId, publicationVerifiedAt: at, publishedAt: remoteDate(work.createDate), phase: 'published' });
       entry.report.status = 'published'; entry.report.artworkId = work.artworkId; changed = true;
+    }
+    for (const report of checks) {
+      const item = items.find(item => item.jobId === report.jobId && item.remoteId === report.remoteId);
+      if (item) { item.publicationCheck = { ...report }; changed = true; }
     }
     if (changed) await save();
     if (checks.length) result.publicationChecks = checks;
@@ -233,10 +407,14 @@ export async function createBrowserConnector({ dataDir, driver, now = () => new 
     }
     return result;
   }
-  async function newForm(account, job) {
+  async function newForm(account, job, key) {
     await verify(account);
+    const existingTargets = new Set((await browser.tabs()).map(tab => tab.targetId));
     const tab = await browser.openTab(`https://www.pixiv.net/${job.content.type === 'manga' ? 'manga' : 'illustration'}/create`);
     if (!pixiv(tab)) reject('无法创建 Pixiv 投稿标签页。');
+    ledger[key].targetId = tab.targetId;
+    if (!existingTargets.has(tab.targetId) && tab.targetId !== account.browser?.targetId) ledger[key].ownedTargetId = tab.targetId;
+    await save();
     let identity;
     for (let attempt = 0; attempt < 12; attempt++) {
       await browser.select(tab.targetId);
@@ -260,10 +438,10 @@ export async function createBrowserConnector({ dataDir, driver, now = () => new 
   }
   async function prepare(account, job, files, key) {
     const check = await preflight(account, job);
-    if (!check.ready) reject(check.issues.join(' '), 'unsupported_fields');
+    if (!check.ready) reject(check.issues.join(' '), check.reserved >= 10 ? 'capacity_full' : 'unsupported_fields');
     const when = Date.parse(job.scheduledAt), at = +new Date(now());
     if (!(when > at && when <= at + 7*86400000) || when % 1800000 !== 0) reject('预约时间须在未来一周内，且为整点或半点。');
-    const tab = await newForm(account, job);
+    const tab = await newForm(account, job, key);
     const run = async (...args) => { await browser.select(tab.targetId); return browser.command(args); };
     const set = async (name, value) => run(value ? 'check' : 'uncheck', `input[name="${name}"]`);
     const c = job.content;
@@ -328,6 +506,7 @@ export async function createBrowserConnector({ dataDir, driver, now = () => new 
     const key = createHash('sha256').update(idempotencyKey).digest('hex');
     const previous = ledger[key];
     if (previous) {
+      if (previous.accountId !== account.id || previous.pixivUserId !== account.pixivUserId || previous.jobId !== job.id) reject('提交记录与当前账号或作品不符。', 'identity_mismatch');
       if (previous.remoteId) return { reservation: { remoteId: previous.remoteId, status: 'reserved' } };
       return { error: '此作品已有未确认的浏览器提交记录，请核对原页面，不会自动重复投稿。' };
     }
@@ -342,42 +521,75 @@ export async function createBrowserConnector({ dataDir, driver, now = () => new 
     try {
       checkStopped();
       const { tab, form } = await prepare(account, job, files, key);
-      const beforeData = await verify(account, tab.targetId, { includePublishedIndex: true }), before = normalizeRemote(beforeData);
-      if (!validIndex(beforeData.publicationIndex, account)) reject('无法保存发布核验所需的作品基线，尚未提交预约。请稍后重试。', 'publication_baseline_unavailable');
-      if (before.total >= 10) reject('提交前名额已满，尚未投稿。');
-      if (Date.parse(job.scheduledAt) <= +new Date(now())) reject('提交前预约时间已过，尚未投稿。');
-      if (JSON.stringify(await browser.evaluate(readForm)) !== JSON.stringify(form)) reject('提交前表单发生变化，尚未点击投稿，请重新检查。', 'form_changed');
-      ledger[key].beforeIds = before.reservations.map(r => r.remoteId);
-      if (validIndex(beforeData.publicationIndex, account)) {
-        ledger[key].publishedBaselineIds = [...beforeData.publicationIndex.artworkIds];
-        ledger[key].publicationBaselineAt = new Date(now()).toISOString();
-      }
-      ledger[key].phase = 'submitting'; await save();
-      // A pause received during form preparation takes effect before the one
-      // irreversible click. Once clicked, finish verification as usual.
-      checkStopped();
-      submitted = true; // Any transport error from this point is ambiguous.
-      const click = await browser.evaluate(clickSubmit);
-      if (click?.clicked === false) { submitted = false; reject('投稿按钮不可用，尚未点击投稿。', 'submit_unavailable'); }
-      for (let attempt = 0; attempt < 20; attempt++) {
-        await delay(1000);
-        // The submitting tab redirects on success; use the stable bound tab.
-        const after = normalizeRemote(await verify(account));
-        const added = after.reservations.filter(r => r.kind === 'illust' && !ledger[key].beforeIds.includes(r.remoteId) && titleMatches(r.title,job.title) && r.scheduledAt === new Date(job.scheduledAt).toISOString() && r.pageCount === files.length);
-        if (added.length === 1) {
-          Object.assign(ledger[key], { remoteId: added[0].remoteId, phase: 'confirmed', confirmedAt: new Date(now()).toISOString() });
-          await save(); return { reservation: { remoteId: added[0].remoteId, status: 'reserved' } };
+      return await submitForAccount(account, async () => {
+        checkStopped();
+        if (Object.entries(ledger).some(([otherKey, item]) => otherKey !== key && item.pixivUserId === account.pixivUserId && ['submitting', 'unknown'].includes(item.phase))) {
+          reject('同账号存在未确认的投稿结果，请先核对；本作品尚未提交。', 'reservation_paused');
         }
-        if (added.length > 1) break;
-      }
-      reject('Pixiv 提交结果尚未唯一确认，请核对作品管理页面。不会重复提交。', 'outcome_unknown');
+        const beforeData = await verify(account, tab.targetId, { includePublishedIndex: true }), before = normalizeRemote(beforeData);
+        if (!validIndex(beforeData.publicationIndex, account)) reject('无法保存发布核验所需的作品基线，尚未提交预约。请稍后重试。', 'publication_baseline_unavailable');
+        if (before.total >= 10) reject('提交前名额已满，尚未投稿。', 'capacity_full');
+        if (Date.parse(job.scheduledAt) <= +new Date(now())) reject('提交前预约时间已过，尚未投稿。');
+        if (JSON.stringify(await browser.evaluate(readForm)) !== JSON.stringify(form)) reject('提交前表单发生变化，尚未点击投稿，请重新检查。', 'form_changed');
+        ledger[key].beforeIds = before.reservations.map(r => r.remoteId);
+        if (validIndex(beforeData.publicationIndex, account)) {
+          ledger[key].publishedBaselineIds = [...beforeData.publicationIndex.artworkIds];
+          ledger[key].publicationBaselineAt = new Date(now()).toISOString();
+        }
+        ledger[key].phase = 'submitting'; await save();
+        // A pause received during form preparation takes effect before the one
+        // irreversible click. Once clicked, finish verification as usual.
+        checkStopped();
+        submitted = true; // Any transport error from this point is ambiguous.
+        const click = await browser.evaluate(clickSubmit);
+        if (click?.clicked === false) { submitted = false; reject('投稿按钮不可用，尚未点击投稿。', 'submit_unavailable'); }
+        for (let attempt = 0; attempt < 20; attempt++) {
+          await delay(1000);
+          // The submitting tab redirects on success; use the stable bound tab.
+          const after = normalizeRemote(await verify(account));
+          const added = after.reservations.filter(r => r.kind === 'illust' && !ledger[key].beforeIds.includes(r.remoteId) && titleMatches(r.title,job.title) && r.scheduledAt === new Date(job.scheduledAt).toISOString() && r.pageCount === files.length
+            && !Object.entries(ledger).some(([otherKey, item]) => otherKey !== key && item.pixivUserId === account.pixivUserId && item.remoteId === r.remoteId));
+          if (added.length === 1) {
+            Object.assign(ledger[key], { remoteId: added[0].remoteId, phase: 'confirmed', confirmedAt: new Date(now()).toISOString() });
+            await save();
+            await closeConfirmedForm(key, account);
+            return { reservation: { remoteId: added[0].remoteId, status: 'reserved' } };
+          }
+          if (added.length > 1) break;
+        }
+        reject('Pixiv 提交结果尚未唯一确认，请核对作品管理页面。不会重复提交。', 'outcome_unknown');
+      });
     } catch (e) {
       ledger[key].phase = submitted ? 'unknown' : 'not_submitted'; ledger[key].error = e.message; await save();
-      return submitted ? { error: e.message } : { definitive: true, outcome: 'not_uploaded', ...(e.code === 'reservation_paused' ? { paused: true } : {}), error: e.message };
+      return submitted ? { error: e.message } : { definitive: true, outcome: 'not_uploaded', ...(e.code === 'reservation_paused' ? { paused: true } : {}),
+        ...(e.code === 'capacity_full' ? { capacityBlocked: true } : {}), error: e.message };
     }
   }
-  return {
-    close: () => browser.close?.(),
+  const api = {
+    close: async () => {
+      sharedBrowser.close?.();
+      const entries = [...dedicatedBrowsers.values()]; dedicatedBrowsers.clear();
+      await Promise.all(entries.map(entry => entry.ready.then(value => value.driver.close?.()).catch(() => {})));
+    },
+    openDedicatedLogin: account => atomic(async () => {
+      if (!account?.id || !/^\d+$/.test(account.pixivUserId || '')) reject('请先设置此账号的 Pixiv ID。', 'unbound');
+      if (!dedicatedChrome?.showLogin) reject('尚未配置专用 Chrome 管理器。', 'dedicated_unavailable');
+      await releaseDedicated(account);
+      const opened = dedicatedSession(await dedicatedChrome.showLogin(account));
+      return { mode: opened.mode, loginPending: true };
+    }),
+    verifyDedicated: account => atomic(() => {
+      const dedicated = { ...account, browser: { ...account.browser, mode: 'dedicated' } };
+      return inAccount(dedicated, () => verifyDedicatedAccount(dedicated));
+    }),
+    backgroundDedicated: account => atomic(async () => {
+      if (!dedicatedChrome?.finishLogin) reject('尚未配置专用 Chrome 管理器。', 'dedicated_unavailable');
+      const dedicated = { ...account, browser: { ...account.browser, mode: 'dedicated' } };
+      await inAccount(dedicated, () => verifyDedicatedAccount(dedicated));
+      await releaseDedicated(dedicated);
+      dedicatedSession(await dedicatedChrome.finishLogin(dedicated));
+      return inAccount(dedicated, () => verifyDedicatedAccount(dedicated));
+    }),
     discover: () => atomic(async () => {
       const tabs = (await browser.tabs()).filter(pixiv), accounts = [], errors = [];
       candidates = new Map();
@@ -403,9 +615,70 @@ export async function createBrowserConnector({ dataDir, driver, now = () => new 
       return { account: next, snapshot: remote };
     }),
     snapshot: (account, context) => atomic(() => snapshot(account, context)),
+    analytics: (account, { artworkIds, includeIndex = false, includeAccount = false, bulk = false, offset, limit = 1000 } = {}) => atomic(async () => {
+      if ((!account?.browser?.targetId && !isDedicated(account)) || !/^\d+$/.test(account.pixivUserId || '')) reject('请先为该账号连接 Chrome，才能读取统计数据。', 'unbound');
+      if (artworkIds !== undefined && (!Array.isArray(artworkIds) || artworkIds.length > 10 || artworkIds.some(id => typeof id !== 'string' || !/^\d+$/.test(id)))) reject('统计作品批次无效。', 'invalid_batch');
+      if (bulk && artworkIds !== undefined) reject('统计批量读取和指定作品读取不能同时使用。', 'invalid_batch');
+      if (bulk && (offset !== undefined && (!Number.isSafeInteger(offset) || offset < 0 || offset > 50000)
+        || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000)) reject('统计分页参数无效。', 'invalid_batch');
+      const requested = [...new Set(artworkIds || [])];
+      const result = { pixivUserId: account.pixivUserId, artworks: [], index: null, account: null, complete: true,
+        attemptedArtworkIds: [], failedArtworkIds: [], remainingArtworkIds: requested, errors: [], rateLimited: false, retryAfterSeconds: 0,
+        capabilities: { artworkDetails: true, publishedIndex: true, bulkWorks: true, accountSummary: true } };
+      const finish = () => ({ ...result, observedAt: new Date(now()).toISOString() });
+      if (Date.now() < analyticsResumeAfter) return { ...finish(), complete: false, rateLimited: true,
+        retryAfterSeconds: Math.ceil((analyticsResumeAfter - Date.now()) / 1000), errors: [{ phase: 'request', code: 'rate_limited' }] };
+      await selectAccount(account);
+      const merge = value => {
+        if (!value || value.pixivUserId !== account.pixivUserId || !Array.isArray(value.errors) || !Array.isArray(value.artworks)) reject('Pixiv 统计返回的账号或数据格式不符。', 'analytics_invalid');
+        if (value.errors.some(error => error?.code === 'identity_mismatch')) reject('当前 Pixiv 账号与绑定 ID 不符，已停止统计读取。', 'identity_mismatch');
+        if (value.artworks.some(work => work?.userId !== account.pixivUserId || typeof work.artworkId !== 'string' || !/^\d+$/.test(work.artworkId)
+          || !bulk && !requested.includes(work.artworkId))) reject('Pixiv 统计作品与绑定账号或请求不符。', 'analytics_invalid');
+        if (value.index && (value.index.pixivUserId !== account.pixivUserId || value.index.complete !== true || !Array.isArray(value.index.artworkIds)
+          || value.index.artworkIds.length > 50000 || value.index.total !== value.index.artworkIds.length || new Set(value.index.artworkIds).size !== value.index.artworkIds.length
+          || value.index.artworkIds.some(id => typeof id !== 'string' || !/^\d+$/.test(id)))) reject('Pixiv 统计作品索引格式无效。', 'analytics_invalid');
+        if (value.account && value.account.pixivUserId !== account.pixivUserId) reject('Pixiv 统计账号不符。', 'analytics_invalid');
+        result.artworks.push(...value.artworks);
+        if (value.index) result.index = value.index;
+        if (value.account) result.account = value.account;
+        result.errors.push(...value.errors); result.complete &&= value.complete === true;
+        const limited = value.rateLimited === true || value.errors.some(error => error?.httpStatus === 429);
+        if (limited) {
+          result.rateLimited = true;
+          result.retryAfterSeconds = Math.max(60, ...value.errors.map(error => Number.isFinite(error?.retryAfterSeconds) ? Math.min(86400, Math.max(0, error.retryAfterSeconds)) : 0));
+          analyticsResumeAfter = Math.max(analyticsResumeAfter, Date.now() + result.retryAfterSeconds * 1000);
+        }
+        return value.errors.some(error => error?.phase === 'identity') || limited;
+      };
+      if (includeIndex || includeAccount) {
+        if (merge(await browser.evaluate(readAnalyticsOverview, { expectedId: account.pixivUserId, includeIndex: includeIndex === true, includeAccount: includeAccount === true }))) return finish();
+      }
+      if (bulk === true) {
+        const value = await browser.evaluate(readAnalyticsWorksPage, { expectedId: account.pixivUserId, ...(offset !== undefined ? { offset } : {}), limit });
+        merge(value);
+        for (const name of ['attemptedArtworkIds', 'failedArtworkIds', 'remainingArtworkIds']) {
+          if (!Array.isArray(value[name]) || value[name].some(id => typeof id !== 'string' || !/^\d+$/.test(id))) reject('Pixiv 统计读取进度格式无效。', 'analytics_invalid');
+          result[name] = value[name];
+        }
+        for (const name of ['page', 'fetchRanges', 'nextRange', 'total', 'source']) result[name] = value[name] ?? null;
+        if (result.index && result.total !== null && (result.total !== result.index.total || result.artworks.some(work => !result.index.artworkIds.includes(work.artworkId)))) {
+          result.complete = false; result.errors.push({ phase: 'bulk', code: 'index_mismatch' });
+        }
+        return finish();
+      }
+      if (artworkIds !== undefined) {
+        const value = await browser.evaluate(readArtworkAnalytics, { expectedId: account.pixivUserId, artworkIds: requested });
+        merge(value);
+        for (const name of ['attemptedArtworkIds', 'failedArtworkIds', 'remainingArtworkIds']) {
+          if (!Array.isArray(value[name]) || value[name].some(id => !requested.includes(id))) reject('Pixiv 统计读取进度格式无效。', 'analytics_invalid');
+          result[name] = value[name];
+        }
+      }
+      return finish();
+    }),
     searchTags: (account, words, { includeHistory = false, historyLimit, fullHistory = false, historyOffset = 0, historyTimeBudgetMs = 120000 } = {}) => atomic(async () => {
-      if (!account?.browser?.targetId) reject('请先为该账号连接 Chrome，才能匹配 Pixiv 全站标签。');
-      await select(account.browser.targetId);
+      if (!account?.browser?.targetId && !isDedicated(account)) reject('请先为该账号连接 Chrome，才能匹配 Pixiv 全站标签。');
+      await selectAccount(account);
       const selectedWords = [...new Set(words)].slice(0, 256);
       if (includeHistory !== true || fullHistory !== true) return browser.evaluate(readTags, {expectedId:account.pixivUserId,words:selectedWords,includeHistory:includeHistory === true,
         ...(includeHistory === true && Number.isInteger(historyLimit) ? {historyLimit:Math.max(1,Math.min(60,historyLimit))} : {})});
@@ -519,7 +792,12 @@ export async function createBrowserConnector({ dataDir, driver, now = () => new 
         if (Object.values(ledger).some(other => other !== item && other.accountId === account.id && other.remoteId === remote.remoteId)) reject('此远端预约已关联另一件本地作品。');
         item.remoteId = remote.remoteId; item.phase = 'confirmed'; item.confirmedAt ||= new Date(now()).toISOString();
         if (adopt) item.scheduledAt = remote.scheduledAt;
-        item.title = job.title; item.publicationExpected = publicationExpected({ ...job, scheduledAt: item.scheduledAt });
+        const expected = publicationExpected({ ...job, scheduledAt: item.scheduledAt });
+        if (expected && item.publicationExpected && (Object.hasOwn(item.publicationExpected, 'tags') || Object.hasOwn(item.publicationExpected, 'xRestrict'))) {
+          delete expected.tags; delete expected.xRestrict;
+          for (const field of ['tags', 'xRestrict']) if (Object.hasOwn(item.publicationExpected, field)) expected[field] = clone(item.publicationExpected[field]);
+        }
+        item.title = job.title; item.publicationExpected = expected;
       } else {
         const url = String(input.artworkUrl || '');
         const match = /^https:\/\/www\.pixiv\.net\/(?:[a-z]{2}\/)?artworks\/(\d+)\/?$/.exec(url);
@@ -533,6 +811,13 @@ export async function createBrowserConnector({ dataDir, driver, now = () => new 
       }
       await save(); return snapshot(account);
     }),
-    reserve: (account, job, files, key, controls) => atomic(() => reserve(account, job, files, key, controls)),
+    reserve: (account, job, files, key, controls) => {
+      return inAccount(account, () => reserve(account, job, files, key, controls), { reservation: true });
+    },
   };
+  for (const method of ['snapshot', 'analytics', 'searchTags', 'preflight', 'reconcile']) {
+    const operation = api[method];
+    api[method] = (account, ...args) => inAccount(account, () => operation(account, ...args));
+  }
+  return api;
 }

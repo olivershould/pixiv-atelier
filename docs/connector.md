@@ -1,6 +1,6 @@
 # 本机连接服务协议
 
-这是应用与可选外部执行端之间的接口约定，**不是 Pixiv 官方 API**。应用另有内置 Chrome 后台连接，可连接用户已授权的现有浏览器，详见 [Chrome 连接说明](chrome-connection.md)。本文不代表外部连接器已实现；外部执行端需要独立部署与验证。
+这是应用与可选外部执行端之间的接口约定，**不是 Pixiv 官方 API**。应用另有内置 Chrome 后台连接，推荐每账号使用专用浏览器，也兼容已授权的现有浏览器，详见 [Chrome 连接说明](chrome-connection.md)。本文不代表外部连接器已实现；外部执行端需要独立部署与验证。
 
 **本地识图与 Pixiv 投稿连接相互独立。** 安装本地模型后，即使没有配置 `PIXIV_CONNECTOR_URL`、没有登录 Pixiv，也可以分析本机已上传的图片。默认识图由本地 Python / ONNX worker 完成；不会自动回退到连接器或使用演示标签替代失败结果。真正上传、同步账号及确认发布需要内置 Chrome 连接，或实现本文协议的外部连接器。
 
@@ -29,19 +29,21 @@
 
 响应包含模型及目录版本、逐图 SHA-256、`inputFingerprint`、`requestFingerprint`、捕获时的 `mode`，以及 `modeChanged`、`sourceChanged`、`stale`。前端必须对照发起分析时的表单与图片顺序；若当前输入已改变或 `stale:true`，不得将旧建议应用到新作品。`draft` 尚未保存的改动只能由前端对照；服务器不会获知后来没有提交的输入。
 
-本地运行配置由设置脚本写入私有的 `.data/tagger-config.json`，记录经过自检的 Python、模型与运行库路径；可用 `PIXIV_TAGGER_PYTHON` 显式覆盖解释器。配置不是浏览器提交的命令，也不会通过 shell 执行。模型或运行环境未就绪时，分析返回真实错误，不产生替代标签。
+本地运行配置由设置脚本写入私有的 `.data/tagger-config.json`，记录经过自检的 Python、模型与运行库路径；项目内路径相对项目根解析，无配置时可发现 `.runtime/python/python.exe`。手动终端启动可用 `PIXIV_TAGGER_PYTHON` 显式覆盖解释器，Windows 后台启动器会清理该变量。配置不是浏览器提交的命令，也不会通过 shell 执行；worker 使用 Python 隔离模式。模型或运行环境未就绪时，分析返回真实错误，不产生替代标签。
 
 ## 可选的 Pixiv 投稿连接器
 
-在启动本地应用前设置环境变量：
+外部连接器与内置 Chrome 方式互斥。开发者需自行部署符合协议的回环服务，再从终端显式启动应用；Windows 后台启动器会清理连接器变量，不能用它传入下面的开发配置：
 
 ```powershell
-$env:PIXIV_CONNECTOR_URL = 'http://127.0.0.1:另一个端口'
+$env:PIXIV_CONNECTOR_URL = 'http://127.0.0.1:4320'
 # 如连接服务需要，在本机配置 PIXIV_CONNECTOR_TOKEN；请勿提交到版本库。
-./Start.ps1
+node server/index.mjs
 ```
 
 只允许 `http/https` 回环地址，不允许 URL 用户信息、查询参数或片段。带令牌时请求附 `Authorization: Bearer …`。前端不会收到令牌。默认本地识图不会向该连接器发送图片；用户显式选择连接器建议或执行真实投稿后，才按相应接口发送所需作品数据。
+
+外部连接器仍按单件预约流程执行，不继承内置 Chrome 的两个独立投稿页或自动关闭页面能力。本文的快照、投稿、标签接口也不自动提供内置统计采集；统计说明见 [数据统计口径](analytics.md)。
 
 ## GET /accounts/:accountId/snapshot
 

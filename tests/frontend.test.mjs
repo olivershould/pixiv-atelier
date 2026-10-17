@@ -25,7 +25,7 @@ async function browserFixture(t, browserRoutes = false, initialTime = NOW) {
   let state = { ...createDemoState(new Date(initialTime)), mode: 'live', now: initialTime, connectorConfigured: false, tagger: { available: true, catalogEntries: 5 } };
   state.settings = { ...state.settings, mode: 'live', demo: false };
   for(const job of state.jobs){job.canDeleteLocally=job.status==='queued';job.deleteBlockedReason=job.canDeleteLocally?'':'作品已经提交到 Pixiv，请保留记录以核对状态。';}
-  const handlers = new Map(), requests = [], pending = [], syncPending = [], queuePending = [], memoryPending = [], deletePending = [], poolPending = [], characterPending = [], eventPromises = [], intervals = new Map();
+  const handlers = new Map(), requests = [], pending = [], syncPending = [], queuePending = [], dedicatedPending = [], memoryPending = [], deletePending = [], poolPending = [], characterPending = [], eventPromises = [], intervals = new Map();
   const tagPools=new Map(),templateCatalogs=new Map(),templatePending=[];let deferPoolReads=false,deferTemplateReads=false;
   const nameTimers=new Map();let timerSequence=0,deferCharacterResolves=false;
   let characters = [];
@@ -116,6 +116,13 @@ async function browserFixture(t, browserRoutes = false, initialTime = NOW) {
     if (url === '/api/jobs') { const job={...state.jobs[10],...payload,id:'created-'+requests.length};state.jobs.push(job);state.createdJobId=job.id;return httpResponse(state); }
     if(url.startsWith('/api/jobs/')&&options.method==='PATCH'){const id=url.split('/').at(-1),job=state.jobs.find(item=>item.id===id);if(!job)throw new Error('Unknown test job');Object.assign(job,payload);return httpResponse(state);}
     if (url === '/api/settings') { state.settings = { ...state.settings, ...payload }; return httpResponse(state); }
+    if(browserRoutes&&/^\/api\/accounts\/[^/]+\/browser-dedicated\/(open|verify|background)$/.test(url))return new Promise(resolve=>{
+      const [,accountId,operation]=url.match(/^\/api\/accounts\/([^/]+)\/browser-dedicated\/(open|verify|background)$/),account=state.accounts.find(item=>item.id===accountId);
+      dedicatedPending.push({accountId,operation,settled:false,
+        succeed(update){if(this.settled)return;this.settled=true;Object.assign(account,update);state.connectorConfigured=true;resolve(httpResponse(state));},
+        fail(message,update){if(this.settled)return;this.settled=true;if(update)Object.assign(account,update);resolve(httpResponse({error:message},false));},
+      });
+    });
     if (browserRoutes && url === '/api/browser/discover') return httpResponse({ accounts: [{ candidateId: 'candidate', pixivUserId: state.accounts[0].pixivUserId, name: state.accounts[0].name, premium: true }], message: '已检测到 1 个账号。' });
     if (browserRoutes && url === `/api/accounts/${state.accounts[0].id}/browser`) {
       assert.equal(payload.candidateId, 'candidate'); state.accounts[0].browser = { targetId: 'A'.repeat(32), postingEnabled: false };
@@ -176,8 +183,8 @@ async function browserFixture(t, browserRoutes = false, initialTime = NOW) {
   const editorTags = () => [...(app.innerHTML.match(/<div class="tag-editor">([\s\S]*?)<input id="tag-input"/)?.[1]||'').matchAll(/<span class="tag">([^<]*)<button/g)].map(match=>match[1]);
   const first = state.jobs[10], second = state.jobs[11];
   async function openFirst() { await click('nav:works'); await click('filter:queued'); await click(`edit:${first.id}`); }
-  t.after(async () => { for (const item of [...pending,...syncPending,...queuePending,...memoryPending,...deletePending,...poolPending,...characterPending,...templatePending]) item.succeed(); await Promise.allSettled(eventPromises); });
-  return { app, toast, requests, pending, syncPending, queuePending, memoryPending, deletePending, poolPending, characterPending, click, change, input, search, poolSearch, typeTag, inputMemoryTag, pressMemoryKey, pressMemoryEnter, composeMemoryTag, typeMemoryTag, memoryTags, pendingMemoryTag, editorTags, actionElement, dispatchClick, openFirst, first, second,
+  t.after(async () => { for (const item of [...pending,...syncPending,...queuePending,...dedicatedPending,...memoryPending,...deletePending,...poolPending,...characterPending,...templatePending]) item.succeed(); await Promise.allSettled(eventPromises); });
+  return { app, toast, requests, pending, syncPending, queuePending, dedicatedPending, memoryPending, deletePending, poolPending, characterPending, click, change, input, search, poolSearch, typeTag, inputMemoryTag, pressMemoryKey, pressMemoryEnter, composeMemoryTag, typeMemoryTag, memoryTags, pendingMemoryTag, editorTags, actionElement, dispatchClick, openFirst, first, second,
     async runInterval(delay){await intervals.get(delay)?.();await flush();},
     async imageError(target){for(const callback of handlers.get('error')||[])await callback({target});},
     deferCharacterResolves(value=true){deferCharacterResolves=value;},
@@ -559,9 +566,55 @@ test('dashboard sync prevents duplicate requests, permits navigation and refresh
  assert.equal(b.requests.some(r=>r.url==='/api/queue/tick'),false);
 });
 
+test('publication review details explain each unresolved reason without exposing internal codes',async t=>{
+ const b=await browserFixture(t),job=b.first;
+ b.state.jobs=[job];job.status='needs_review';job.reviewReason='reservation_missing_remotely';job.lastError='reservation_missing_remotely';
+ const reasons={ambiguous_match:'找到多个相似作品',baseline_missing:'缺少预约前的已发布作品记录',metadata_missing:'作品信息尚不完整',published_index_unavailable:'暂时无法读取完整的已发布作品列表',candidate_limit:'待比对作品过多',candidate_read_failed:'部分候选作品读取失败',no_unique_match:'暂未找到唯一匹配的已发布作品',publication_evidence_missing:'用于区分同名作品的标签或年龄分级资料不完整，暂不能确认',publication_evidence_mismatch:'Pixiv 作品的标签或年龄分级与投稿记录不一致，保留待核实'};
+ await b.click('nav:works');
+ for(const [reason,message]of Object.entries(reasons)){
+  job.publicationCheck={status:'unresolved',reason,checkedAt:NOW};
+  await b.click('refresh');await b.click('attention');await b.click('edit:'+job.id);
+  assert.ok(b.app.innerHTML.includes(message));assert.match(b.app.innerHTML,/发布状态待核实/);assert.match(b.app.innerHTML,/上次核实：/);
+  assert.match(b.app.innerHTML,/每 6 小时自动核实；也可在工作台点击「同步 Pixiv 状态」立即核实，不会投稿/);
+  assert.doesNotMatch(b.app.innerHTML,/reservation_missing_remotely/);assert.ok(!b.app.innerHTML.includes(reason));
+  await b.click('close-modal');
+ }
+ for(const reason of [undefined,'new_reason_<img src=x onerror=bad>','constructor']){
+  job.publicationCheck=reason?{status:'unresolved',reason,checkedAt:'not-a-date'}:undefined;
+  await b.click('refresh');await b.click('edit:'+job.id);
+  assert.match(b.app.innerHTML,/暂未取得足以确认发布的证据，保留待核实状态/);assert.doesNotMatch(b.app.innerHTML,/上次核实：|Invalid Date|onerror=bad/);
+  await b.click('close-modal');
+ }
+ assert.equal(b.requests.some(request=>request.url==='/api/pixiv/sync'||request.url==='/api/queue/start'),false);
+});
+
+test('dashboard reuses read-only Pixiv sync to review pending publications and clears its hint after confirmation',async t=>{
+ const b=await browserFixture(t),job=b.first,other={...structuredClone(b.second),status:'needs_review',reviewReason:'schedule_expired',lastError:'预约时间已过，请设置未来时间。'};
+ b.state.jobs=[job,other];job.status='needs_review';job.reviewReason='reservation_missing_remotely';
+ b.state.settings.queuePaused=true;for(const account of b.state.accounts)account.browser={mode:'dedicated',postingEnabled:false};
+ await b.click('refresh');await b.click('nav:overview');
+ assert.match(b.app.innerHTML,/1 件远端作品待核实/);assert.match(b.app.innerHTML,/每 6 小时自动核实，也可点击「同步 Pixiv 状态」立即核实，不会投稿/);
+ const before=b.requests.length,run=b.click('sync-pixiv');await flush();assert.equal(b.syncPending.length,1);
+ job.status='published';delete job.reviewReason;delete job.publicationCheck;b.syncPending[0].succeed();await run;
+ assert.doesNotMatch(b.app.innerHTML,/件远端作品待核实/);
+ assert.deepEqual(b.requests.slice(before).filter(request=>request.method==='POST').map(request=>request.url),['/api/pixiv/sync']);
+ assert.equal(b.state.settings.queuePaused,true);assert.ok(b.state.accounts.every(account=>account.browser.postingEnabled===false));
+ await b.click('attention');await b.click('edit:'+other.id);assert.match(b.app.innerHTML,/预约时间已过，请设置未来时间/);assert.doesNotMatch(b.app.innerHTML,/发布状态待核实/);
+});
+
+test('demo review records never promise automatic remote publication checks',async t=>{
+ const b=await browserFixture(t);b.first.status='needs_review';b.first.reviewReason='reservation_missing_remotely';
+ await b.click('refresh');await b.click('nav:settings');await b.click('switch-demo');await b.click('nav:overview');
+ assert.doesNotMatch(b.app.innerHTML,/件远端作品待核实/);await b.click('attention');await b.click('edit:'+b.first.id);
+ assert.doesNotMatch(b.app.innerHTML,/每 6 小时自动核实/);
+});
+
 test('start reservations is one explicit action, prevents duplicate starts and leaves navigation available',async t=>{
  const b=await browserFixture(t),button=b.actionElement('start-queue');
  assert.match(b.app.innerHTML,/自动每 6 小时检查；开始预约可立即执行一轮/);
+ assert.match(b.app.innerHTML,/最多同时准备 2 件作品；同账号依次确认预约，不同账号可同时提交/);
+ assert.match(b.app.innerHTML,/成功后自动关闭应用本次新开的投稿页；失败或待核对页面保留，原有标签页不变/);
+ assert.doesNotMatch(b.app.innerHTML,/按预约时间依次上传/);
  const starting=b.dispatchClick(button);await flush();
  assert.equal(b.actionElement('start-queue').disabled,true);assert.equal(b.actionElement('sync-pixiv').disabled,true);
  assert.match(b.app.innerHTML,/正在预约…/);assert.equal(b.hasDialog(),false);
@@ -605,6 +658,8 @@ test('a running reservation round survives page refresh and the live start butto
  const b=await browserFixture(t);b.state.queueRun={running:true,startedAt:NOW,source:'automatic',completedAt:null};await b.click('refresh');
  assert.equal(b.actionElement('start-queue').disabled,true);assert.match(b.app.innerHTML,/正在核对发布状态/);
  await b.click('nav:settings');assert.match(b.app.innerHTML,/自动每 6 小时检查/);assert.doesNotMatch(b.app.innerHTML,/每分钟检查/);
+ assert.match(b.app.innerHTML,/最多同时准备 2 件作品；同账号依次确认预约，不同账号可同时提交/);
+ assert.match(b.app.innerHTML,/确认预约成功后，只关闭应用本次新开的投稿页/);assert.match(b.app.innerHTML,/失败或待核对时保留页面，原有标签页保持不变/);
  await b.click('switch-demo');await b.click('nav:overview');assert.doesNotMatch(b.app.innerHTML,/data-action="start-queue"/);
  const before=b.requests.length;await b.runInterval(3000);assert.equal(b.requests.length,before);
 });
@@ -744,6 +799,22 @@ test('two queued clicks in the same editor send only one recognition request', a
   assert.equal(browser.hasDialog(), true);
 });
 
+test('unconnected banner manages account logins without discovering everyday Chrome',async t=>{
+ const b=await browserFixture(t,true);
+ const bannerMarkup=()=>b.app.innerHTML.match(/<div class="banner warning">[\s\S]*?<\/button><\/div>/)?.[0]||'';
+ for(const dedicated of [false,true]){
+  for(const account of b.state.accounts){account.connected=false;if(dedicated)account.browser={mode:'dedicated',loginPending:true,targetId:null,postingEnabled:false};else delete account.browser;}
+  await b.click('refresh');await b.click('nav:overview');
+  assert.match(bannerMarkup(),/data-action="nav:accounts"[^>]*>[\s\S]*管理登录/);
+  assert.doesNotMatch(bannerMarkup(),/browser-discover|连接我的账号/);
+  const before=b.requests.length;await b.click('nav:accounts');
+  assert.match(b.app.innerHTML,dedicated?/打开登录窗口/:/使用专用 Chrome/);
+  assert.match(b.app.innerHTML,/连接现有 Chrome/);
+  assert.equal(b.requests.slice(before).some(request=>request.url==='/api/browser/discover'||request.url.includes('/browser-dedicated/')),false);
+ }
+ assert.equal(b.requests.some(request=>request.url==='/api/browser/discover'),false);
+});
+
 test('Chrome discovery binds the existing account and posting requires its own confirmation', async t => {
   const browser = await browserFixture(t, true);
   await browser.click('nav:accounts');
@@ -759,6 +830,35 @@ test('Chrome discovery binds the existing account and posting requires its own c
   await browser.click('confirm-action');
   assert.equal(browser.state.accounts[0].browser.postingEnabled, true);
   assert.equal(browser.requests.filter(r => r.url.endsWith('/browser-posting')).length, 1);
+});
+
+test('dedicated Chrome login verifies the saved account before background mode and does not collect or post',async t=>{
+ const b=await browserFixture(t,true),account=b.state.accounts[0],other=structuredClone(b.state.accounts[1]),jobs=structuredClone(b.state.jobs);
+ account.browser={targetId:'legacy',postingEnabled:true};const original={id:account.id,name:account.name,pixivUserId:account.pixivUserId,defaultPostingTime:account.defaultPostingTime,avatarUrl:account.avatarUrl};
+ await b.click('refresh');await b.click('nav:accounts');assert.match(b.app.innerHTML,/使用专用 Chrome/);assert.match(b.app.innerHTML,/连接现有 Chrome/);
+ let action=b.click('browser-dedicated-open:'+account.id);await flush();assert.equal(b.dedicatedPending[0].operation,'open');assert.match(b.app.innerHTML,/正在打开…/);assert.equal(b.actionElement('browser-dedicated-open:'+account.id).disabled,true);
+ await b.click('browser-dedicated-open:'+account.id);assert.equal(b.dedicatedPending.length,1);
+ b.dedicatedPending[0].succeed({connected:false,browser:{mode:'dedicated',runtimeMode:'interactive',loginPending:true,postingEnabled:false}});await action;
+ assert.match(b.app.innerHTML,/专用 Chrome · 待登录/);assert.equal(b.actionElement('browser-dedicated-background:'+account.id).disabled,true);assert.equal(b.actionElement('browser-posting:'+account.id).disabled,true);
+ await b.click('browser-dedicated-background:'+account.id);assert.equal(b.dedicatedPending.length,1);
+ action=b.click('browser-dedicated-verify:'+account.id);await flush();assert.equal(b.dedicatedPending[1].operation,'verify');
+ b.dedicatedPending[1].fail('登录账号与原 Pixiv ID 不匹配：<other>',{connected:false,browser:{mode:'dedicated',runtimeMode:'interactive',loginPending:true,postingEnabled:false}});await action;
+ assert.match(b.app.innerHTML,/登录账号与原 Pixiv ID 不匹配：&lt;other&gt;/);assert.equal(b.actionElement('browser-dedicated-background:'+account.id).disabled,true);assert.equal(b.state.accounts[0].browser.postingEnabled,false);
+ action=b.click('browser-dedicated-verify:'+account.id);await flush();b.dedicatedPending[2].succeed({connected:true,browser:{mode:'dedicated',runtimeMode:'interactive',loginPending:false,targetId:'verified',postingEnabled:true}});await action;
+ assert.match(b.app.innerHTML,/专用 Chrome · 已连接/);assert.match(b.app.innerHTML,/浏览器投稿已开启/);assert.equal(b.actionElement('browser-dedicated-background:'+account.id).disabled,false);
+ action=b.click('browser-dedicated-background:'+account.id);await flush();assert.equal(b.dedicatedPending[3].operation,'background');b.dedicatedPending[3].succeed({browser:{...account.browser,runtimeMode:'headless',targetId:'background'}});await action;
+ assert.match(b.app.innerHTML,/上次运行方式：后台/);assert.match(b.toast.textContent,/已转到后台，登录状态已保留/);
+ for(const [key,value]of Object.entries(original))assert.equal(account[key],value);assert.deepEqual(b.state.accounts[1],other);assert.deepEqual(b.state.jobs,jobs);
+ assert.deepEqual(b.requests.filter(r=>r.method==='POST').map(r=>r.url),['open','verify','verify','background'].map(operation=>'/api/accounts/'+account.id+'/browser-dedicated/'+operation));
+});
+
+test('dedicated accounts retain a closed posting switch and login controls are absent in demo',async t=>{
+ const b=await browserFixture(t,true),account=b.state.accounts[1];account.connected=false;account.browser={mode:'dedicated',runtimeMode:'headless',loginPending:true,postingEnabled:false};
+ await b.click('refresh');await b.click('nav:accounts');assert.match(b.app.innerHTML,/登录过期时/);assert.match(b.app.innerHTML,/后续无需批准日常 Chrome 的远程调试连接/);
+ const action=b.click('browser-dedicated-verify:'+account.id);await flush();b.dedicatedPending[0].succeed({connected:true,browser:{...account.browser,loginPending:false,postingEnabled:false,targetId:'second-account'}});await action;
+ assert.equal(account.browser.postingEnabled,false);assert.equal(b.actionElement('browser-posting:'+account.id).disabled,false);assert.equal(b.dedicatedPending[0].accountId,account.id);
+ const requests=b.requests.length;await b.click('nav:settings');await b.click('switch-demo');await b.click('nav:accounts');assert.doesNotMatch(b.app.innerHTML,/data-action="browser-dedicated-/);
+ assert.equal(b.requests.slice(requests).some(r=>r.url.includes('/browser-dedicated/')),false);
 });
 
 test('upload automatically analyzes once, fills title/rating and protects edits made while recognition runs', async t=>{
@@ -1126,17 +1226,9 @@ test('late pool responses cannot reopen a closed modal or populate a different w
 
 test('cached Pixiv matches are labeled as saved evidence rather than a fresh lookup',async t=>{
  const b=await browserFixture(t);await b.openFirst();const run=b.click('suggest-tags');await flush();
- b.pending[0].succeed({tagSearch:{source:'pixiv-cache'},candidates:[{tag:'おへそ',preferred:true,source:'pixiv-cache',verified:true,existing:true,freshVerified:false,modelScore:.91}],automaticTags:[]});await run;
+ b.pending[0].succeed({tagSearch:{source:'pixiv-cache'},candidates:[{tag:'おへそ',preferred:true,source:'pixiv-cache',freshVerified:false,modelScore:.91}],automaticTags:[]});await run;
  assert.match(b.app.innerHTML,/常用 · 已缓存/);assert.match(b.app.innerHTML,/本次使用此前保存的 Pixiv 标签记录/);
  assert.doesNotMatch(b.app.innerHTML,/已匹配 Pixiv 全站标签；账号常用且相关的标签优先/);
-});
-
-test('static mappings remain explicitly unverified in the suggestion interface',async t=>{
- const b=await browserFixture(t);await b.openFirst();const run=b.click('suggest-tags');await flush();
- b.pending[0].succeed({candidates:[{tag:'笑顔',source:'static_mapping',verified:false,existing:false,evidence:[],modelScore:.91}],automaticTags:[]});await run;
- assert.match(b.app.innerHTML,/未核实候选来自静态词表/);
- assert.match(b.app.innerHTML,/未核实/);
- assert.doesNotMatch(b.app.innerHTML,/常用 · 已缓存/);
 });
 
 test('pool selection and manual input treat case width spaces and underscores as the same tag',async t=>{
